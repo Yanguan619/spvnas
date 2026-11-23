@@ -69,7 +69,8 @@ b = b[np.lexsort(b.T[::-1])]
 check("真实区域坐标集合逐位一致", a.shape == b.shape and np.array_equal(a, b))
 
 sent_tail = out_cap[u_val:]
-check("尾部全部是哨兵键", bool((sent_tail[:, 1:] == F._SENTINEL).all()),
+check("尾部是行0的重复（不引入新键）",
+      bool((sent_tail == out_cap[0]).all()) if sent_tail.numel() else True,
       "(尾部行数=%d)" % sent_tail.shape[0])
 
 # 再走一级（验证 n 能继续传下去）

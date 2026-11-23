@@ -94,39 +94,50 @@ python demo.py --cr 0.5
 - `spconv_gather_gemm*` 要求 `cin % 8 == 0`（GE 路径用 `_pad_cin_to_8` 把 stem 的 4 通道补齐）。
 - 容量化版本的输出是**定长 CAP**：CAP 由调用方给定，超过 CAP 的帧需要更大 CAP（或分档）。
 
-## 7. 容量化链路的验证进度（当前唯一阻塞项）
+## 7. 容量化链路：已定位到「算子配对契约」，尚未打通
 
-配方模块 `ascend_capacity.py` + 验证脚本 `test_capacity_chain.py`（仓库根）用于对拍
-「容量化路径（定长 CAP + device `n`）」与「固定行数路径」。
+配方模块 `ascend_capacity.py` + 验证脚本 `test_capacity_chain.py`（仓库根）。
 
-| 环节 | 状态 | 证据 |
-|---|---|---|
-| `spconv_sortdedup_v4` | ✅ 一致 | 真实 U 相同（696/895 两种取法都对）；去重坐标集合逐位相同 |
-| `spconv_devox_v4` | ✅ 一致 | `max|d| = 0.000e+00`（对 torch 手算） |
-| `spconv_keyprep_v3` | ✅ 单个算子正确 | 与 shim 的参考实现（`_query_args`）逐位相同：`rkeys` / `cnt` / `meta` / `start = cumsum(cnt)-cnt` 全部相同；`cnt.sum() == N` |
-| **邻域表整链**（keyprep → query） | ❌ **未通** | `nb` 与参考逐位不同 → conv 差 0.28 |
+### 已验证正确（可与参考逐位一致）
 
-### 已排除的假设（每条都做了实验）
+| 环节 | 证据 |
+|---|---|
+| `spconv_sortdedup_v4` | 真实 U 相同（696 / 895 两次）；去重坐标集合逐位相同 |
+| `spconv_keyprep_v3` | `rkeys` / `cnt` / `meta` 与 **纯 torch 公式**（`pack_keys` + hist）逐位相同；`cnt.sum()==N` |
+| `spconv_devox_v4` | `max|d| = 0.000e+00`（对 torch 手算） |
 
-1. ~~旧二进制~~：用本目录源码重建 5 个算子（5/5 `rc=0`）后结果相同。
-2. ~~`sizes` 顺序~~：`[n,m]` 与 `[m,n]` 都试过（后者只有 0.07% 非 -1）。
-3. ~~`nbk`~~：`0` / `8192` / `32768` 都试过。
-4. ~~`keyprep_v3` 输出错~~：见上表——与参考逐位相同。
-5. ~~`query_v2` 自身坏~~：强制改用固定版 `spconv_query`（v1）跑容量 buffer，**仍然不匹配**
-   → 问题不在 `query_v2` 这一个算子，而在「keyprep 产出的表」与「query 期望的表」之间的
-   **配对参数**（`meta[0]` 里的 `shift` 与 `start.numel()` 即 `nbk` 是否与参考路径一致）。
-6. ~~padding 污染包围盒~~：padding 从随机坐标改为「有效行重复」后仍不匹配（且 `CAP == N`
-   完全无 padding 时也不匹配），所以不是 padding 撑大 `lo/dims`。
+### 决定性发现：`query` 的第 3 个参数是 `srt`，不是桶偏移表
 
-### 下一步（精确到变量）
+- 对**完全相同的输入**，op 产出的表与纯 torch 公式产出的表**逐位相同**
+  （`nbk=4096`、`shift=0`、`lo=[0,-1,-1,-1]`、`dims=[1,10,10,10]`）；
+- 但把这张表喂给 `spconv_query`，仍返回**全 -1**；
+- 而 `spconv_keyprep_v2` 的第 2 个输出 **`srt` 长度为 `nbk`**（4096），不是 N；
+  shim 的 `_query_args` 正是把 **`srt`** 当 `start` 传给 query：
+  `return rk, srt, cn, mt` → `spconv_query(q, rkeys, srt, cnt, meta)`。
+- **`spconv_keyprep_v3` 没有 `srt` 输出**（只有 `rkeys, cnt, meta, scratch`），
+  且它的 torch 封装里 `start` 是独立 `at::empty`、从未传给 aclnn。
 
-在同一次运行里同时打印两条路径的 **`meta[0]`（shift）与 `start.numel()`（nbk）**：
+**结论：`keyprep_v3` 与 `query`/`query_v2` 不是配套的一对。** 之前记录的
+「keyprep_v3 / query_v2」配对从未被验证过——每个算子的单测都是各自对着
+「`_query_args` 产出的表」测的，而那张表的 `srt` 来自 `keyprep_v2`。
 
-- 参考路径：`torchsparse.backend._query_args(...)`（注意它会走 op 分支或 torch 分支，分支不同
-  `nbk` 公式相同但 `total`/`shift` 来源不同）；
-- 容量路径：`ascend_capacity.kernel_map(...)`（`nbk=0` 时由 wrapper 自己算）。
+### 已排除的其他假设
 
-若 `nbk`/`shift` 不一致 → 在 `kernel_map` 里对齐（把参考路径的 `nbk` 显式传进去）即可；
-若一致仍不匹配 → 是 `query` 家族算子与 Python 侧表构造的**桶函数不parity**，需要改 kernel。
+旧二进制（源码重建后相同）、`sizes` 顺序、`nbk` 取值、`keyprep_v3` 输出错误、
+`query_v2` 单独损坏、padding 撑大 `lo/dims`（改用有效行重复、甚至 CAP==N 仍不匹配）。
+
+### 一条尝试过的替代路线（当前不可用）
+
+绕过 query 算子、直接用纯 torch 的 `_lookup_offsets` 在容量 buffer 上算 `nb`：
+**触发 507035 vector core exception**（疑似补齐行导致 key 落在表外 → 越界 gather）。
+该路线在补齐行与 `total` 的关系上还需要严格推导，不能直接上板试。
+
+### 下一步（两步走，不建议再盲试）
+
+1. **补 `srt`**：给 `spconv_keyprep_v3` 增加 `srt` 输出（`nbk` 长的桶→首索引表），
+   或在 Python 侧用 `torch.sort` + `arange` 构造等价的 `srt`（device 端，无 host 同步）。
+   然后复测 `query_v2`；这一步应能让 `nb` 与参考逐位一致。
+2. **再做模型接线**：`ascend_capacity.kernel_map` 换成新配对后，按 §2 的 5 处替换，
+   并在顶层用 `arange(CAP) < n` 掩掉补齐行。
 
 **在 `nb` 与参考逐位一致之前，不要切换模型默认路径**（现默认仍是固定行数版，零回归）。

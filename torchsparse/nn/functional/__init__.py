@@ -666,6 +666,11 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
     caches = input._caches
     # 容量模式：真实行数随 SparseTensor 传入；所有分支都需要它（尾部 return 用）
     n_in = getattr(input, "n", None)
+    if n_in is None and cap_enabled():
+        # 兜底：任何一层只要有 scope 内的 caches，就能按 stride 取回真实行数
+        n_in = caches.nmaps.get(tuple(input.stride))
+    if n_in is not None:
+        caches.nmaps.setdefault(tuple(input.stride), n_in)
     n_out = n_in
     # 全局不变量：补齐行的特征一律视为 0。映射层怎么绕都不会把 padding 值放大进真实行。
     if n_in is not None and cap_enabled():
@@ -759,10 +764,14 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
                 # the fused forward path never builds nb; rebuild it from the
                 # parent coords it published (rows = child = this input)
                 _t0 = _now()
-                nb_t = _rect_map(out_coords, coords, ks, st, dl)
+                # 容量模式必须带 n，否则会掉回非容量路径（_query_args 里有 host 读回，
+                # 入图就是 graph break）。这里 in=细层、out=粗层，与 forward 的 nb 同构。
+                nb_t = _rect_map(out_coords, coords, ks, st, dl,
+                                 n_in=caches.nmaps.get(out_stride),
+                                 n_out=getattr(input, "n", None))
                 _tick("1b_kmap_build", _t0)
                 caches.nbmaps[tkey] = nb_t
-            if nb_t is not None:
+            if nb_t is not None and not cap_enabled():
                 kmap = _compact_from_nb(nb_t)
                 caches.kmaps[tkey] = kmap
         # ---- 快路径：nb_t 取逆 + 一次 gather_gemm ----
@@ -793,6 +802,15 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
             except Exception:
                 pass
         # ---- 原路径 ----
+        if kmap is None and nb_t is not None:
+            if cap_enabled():
+                # 不能退化：host 侧建图（nonzero/tolist）入图后会烘死，静默算错。
+                raise RuntimeError(
+                    "容量模式下转置卷积的 device-only 快路径未命中"
+                    "（检查 feats.shape[1]%%8、nb_t 形状、_TS_DECONV_INV）；"
+                    "拒绝回退到 _compact_from_nb，避免入图后静默算错")
+            kmap = _compact_from_nb(nb_t)
+            caches.kmaps[tkey] = kmap
 
         if kmap is None:
             raise RuntimeError(
@@ -870,6 +888,13 @@ while _CAP_NBK < 4 * max(_CAP, 1):
 
 def cap_enabled():
     return _CAP > 0
+
+
+# 容量模式下强制 device-only 的转置路径：`_compact_from_nb` 用 nonzero/tolist 在
+# host 侧建图，被入图后会烘死在图里（不同帧复用 → 结果错到 97.9%）。实测开这条
+# 路径后 编译结果与 eager 完全一致（4.768e-06 / argmax 100%）。
+if _CAP > 0:
+    _TS_DECONV_INV = True
 
 
 def cap_size():
@@ -981,9 +1006,10 @@ def _spdevoxelize_eager(feats, coords, weights):
 # 容量化 .so 必须在入图**之前**加载：在被 torch.compile trace 的区域里调用
 # torch.ops.load_library 会让 GE 报 "GRAPH internal error"。
 if _CAP > 0:
-    try:
-        for _op in ("keyprep_v3", "query_v2", "gather_gemm_v2"):
-            _load_cap_so(_op)
-        _load_cap_so("sortdedup_v4")
-    except Exception:
-        pass
+    # 固定行数版也要预加载：转置卷积的 device-only 快路径依赖 _sgg_op()，
+    # 而它在首次调用里做 load_library —— 那已经发生在被 trace 的区域了。
+    for _op in ("keyprep_v3", "query_v2", "gather_gemm_v2", "sortdedup_v4",
+                "sortdedup_v3", "keyprep_v1", "keyprep_v2", "query",
+                "gather", "gather_v2", "gather_gemm", "devox", "devox_v3",
+                "nb"):
+        _load_cap_so(_op)

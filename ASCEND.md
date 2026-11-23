@@ -162,3 +162,41 @@ m = torch.compile(m, backend=torchair.get_npu_backend(), dynamic=True)   # GE �
 > 真正的零重录需要把 conv 链切成容量化算子（输出定长 CAP + device 侧 `n`），
 > 该链路目前卡在 `spconv_keyprep_v3`（`start`/`cnt` 输出全 0），见 `csrc/ascend/README.md §7`。
 
+## 容量化 + GE 动态（Stage D：一张图吃任意点数）
+
+`TS_CAP=<CAP>`（coords 固定 CAP 行、真实行数放在 device 标量 `n`）配合
+`torch.compile(backend=torchair.get_npu_backend(), dynamic=True)`，910B4 实测：
+
+```bash
+TS_GE_COMPAT=1 TS_CAP=20480 UNUM_OPS_ROOT=... \
+  python3 stageD_test.py
+```
+
+| 帧点数 | max\|d\| vs eager | argmax 一致 |
+|---|---|---|
+| 20000 | 4.768e-06 | 100.0000% |
+| 12000 | 5.007e-06 | 100.0000% |
+
+- 20k 首跑 103.0 s（含编译），**12k 首跑 0.1 s → 没有重编**：一张图吃两种点数；
+- `TORCH_LOGS=graph_breaks` 下**零 graph break**（整模进一张 GE 图）；
+- 不再需要 `TS_FG` 按形状冻结。
+
+### 四条硬约束（都是实测踩出来的）
+
+1. **容量 .so 必须在入图之前加载**。在被 trace 的区域里调用
+   `torch.ops.load_library` 会让 GE 报 `ERR03005 GRAPH internal error`。
+   `torchsparse/nn/functional/__init__.py` 在 `TS_CAP>0` 时于导入期预加载全部算子。
+2. **`keyprep_v3` 必须显式传固定 nbk**（≥ 4·CAP 的 2 的幂）。kernel 默认按**真实** n
+   自动算，而 Meta 只能按 CAP 算；两者不一致会让 `cumsum(cnt)` 在未初始化的桶上累加。
+3. **容量模式下禁止 host 侧建图**（`_compact_from_nb` 里的 `nonzero()/tolist()`）。
+   被入图后会烘死，换一帧静默算错（实测 argmax 掉到 97.9%）。转置卷积因此强制走
+   device-only 快路径，且**不允许静默回退**（回退直接报错）。
+4. **`n` 必须有兜底**：`caches.nmaps[stride]`。某层 `n=None` 会让 `point_to_voxel`
+   退回 `scatter_mean`，行数被 `max(index)+1` 截断（实测 17900 ≠ CAP 20480），
+   进而让转置卷积的快路径条件失效。
+
+### 与旧结论的关系
+
+之前"GE 动态"是**每形状冻结一次**（`TS_FG=record/replay`）；容量化把 Python 侧那几处
+host 读回（去重行数、包围盒乘积、数据相关 nonzero）全部搬到 device 之后，才真正做到
+**一张图 + 任意 N ≤ CAP**。

@@ -110,6 +110,17 @@ def initial_voxelize(z, init_res, after_res):
 
 # x: SparseTensor, z: PointTensor
 # return: SparseTensor
+def _lvl_n(x):
+    """取某层的真实行数：优先 x.n，退回 caches.nmaps[stride]（容量模式）。"""
+    n = getattr(x, "n", None)
+    if n is None:
+        try:
+            n = x._caches.nmaps.get(tuple(x.s))
+        except Exception:
+            n = None
+    return n
+
+
 def point_to_voxel(x, z):
     if z._caches.idx_query.get(x.s) is None:
         # Note: x.C has a smaller range after downsampling.
@@ -120,16 +131,24 @@ def point_to_voxel(x, z):
             ],
             1,
         )
-        idx_query = sphashquery(new_int_coord, x.C)
+        if spf.cap_enabled() and _lvl_n(x) is not None:
+            # device-only：容量版邻域表（ks=1），避免 sphashquery -> _query_args 里
+            # int(h[4]) 的 host 读回（入图是 Tensor.item() graph break）
+            _np = torch.tensor([new_int_coord.shape[0]], dtype=torch.int32,
+                               device=new_int_coord.device)
+            idx_query = spf._rect_map(x.C, new_int_coord, 1, (1, 1, 1), 1,
+                                      n_in=_lvl_n(x), n_out=_np).transpose(0, 1).contiguous()
+        else:
+            idx_query = sphashquery(new_int_coord, x.C)
         z._caches.idx_query[x.s] = idx_query
     else:
         idx_query = z._caches.idx_query[x.s]
     # Haotian: This impl. is not elegant
     idx_query = idx_query.clamp_(0)
-    if spf.cap_enabled() and getattr(x, "n", None) is not None:
-        idx_query = _cap_fix_index(idx_query, x.n)
+    if spf.cap_enabled() and _lvl_n(x) is not None:
+        idx_query = _cap_fix_index(idx_query, _lvl_n(x))
         sparse_feat = _masked_mean(z.F, idx_query.reshape(-1), x.C.shape[0])
-        new_tensor = SparseTensor(sparse_feat, x.C, x.s, n=x.n)
+        new_tensor = SparseTensor(sparse_feat, x.C, x.s, n=_lvl_n(x))
         new_tensor._caches = x._caches
         return new_tensor
     sparse_feat = torch_scatter.scatter_mean(z.F, idx_query.long(), dim=0)
@@ -151,9 +170,13 @@ def voxel_to_point(x, z, nearest=False):
             1,
         )
         point_coords_int = torch.floor(point_coords_float).int()
-        idx_query = sphashquery(point_coords_int, x.C, kernel_size=2)
-        if spf.cap_enabled() and getattr(x, "n", None) is not None:
-            idx_query = _cap_fix_index(idx_query, x.n)
+        if spf.cap_enabled() and _lvl_n(x) is not None:
+            _np = torch.tensor([point_coords_int.shape[0]], dtype=torch.int32,
+                               device=point_coords_int.device)
+            idx_query = spf._rect_map(x.C, point_coords_int, 2, (1, 1, 1), 1,
+                                      n_in=_lvl_n(x), n_out=_np).transpose(0, 1).contiguous()
+        else:
+            idx_query = sphashquery(point_coords_int, x.C, kernel_size=2)
         weights = calc_ti_weights(point_coords_float[:, 1:], idx_query, scale=1)
 
         if nearest:

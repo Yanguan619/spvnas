@@ -524,7 +524,7 @@ def _compact_from_nb(nb):
                       ("counts_nb", tuple(nb.shape))))
 
 
-def _kernel_map(in_coords, out_coords, ks, stride, dilation, n_in=None):
+def _kernel_map(in_coords, out_coords, ks, stride, dilation, n_in=None, pad="redirect"):
     """Compacted neighbour pairs, grouped by kernel offset.
 
     One selection over the whole [kernel_volume, n_out] matrix (offset-major)
@@ -532,12 +532,18 @@ def _kernel_map(in_coords, out_coords, ks, stride, dilation, n_in=None):
     offsets = get_kernel_offsets(ks, 1, dilation, device=in_coords.device)
     idx = _lookup_offsets(in_coords, out_coords, stride, offsets)   # [n_out, kv]
     if n_in is not None and cap_enabled():
-        # 补齐行是**不存在的输入行**：这些条目必须**丢弃**（-1），不能折回末行。
-        # 折回会把 padding 的 fine 行全部指到 n_fine-1，而转置卷积按
-        # out[src_fine] += feats[dst_coarse] 累加 → 真实末行被灌入几百次（实测爆到 1e5）。
-        # 越界值（哈希表对缺失键可能返回）一并丢弃，避免 OOB。
+        # 补齐行复用了末行坐标，查表（lookup 对重复键返回**最大**行号）会落在补齐区。
+        # 两种用法需要不同处理：
+        #   pad="redirect"（前向卷积 gather 特征）：折回 n-1 —— 补齐行就是末行的复制，
+        #       语义正确；同时兼作越界安全网。
+        #   pad="drop"（转置卷积）：必须丢弃，因为 `_apply_transposed` 按
+        #       out[src_fine] += feats[dst_coarse] 累加，折回会把 padding 的 fine 行
+        #       全灌进真实末行（实测爆到 1e5）。
         lim = n_in.reshape(()).to(idx.dtype)
-        idx = torch.where(idx >= lim, torch.full_like(idx, -1), idx)
+        if pad == "drop":
+            idx = torch.where(idx >= lim, torch.full_like(idx, -1), idx)
+        else:
+            idx = torch.where(idx >= lim, lim - 1, idx)
     n_out, kv = idx.shape
     flat = idx.T.reshape(-1)                                       # offset-major
     valid = flat >= 0
@@ -721,6 +727,11 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
             _t0 = _now()
             kmap = (None if op_path
                     else _kernel_map(coords, out_coords, ks, st, dl, n_in=n_in))
+            if (not op_path and cap_enabled() and n_in is not None
+                    and out_coords is not None):
+                # 转置卷积要一份「补齐条目丢弃」的图（见 _kernel_map 的 pad 说明）
+                caches.kmaps_drop[key] = _kernel_map(
+                    coords, out_coords, ks, st, dl, n_in=n_in, pad="drop")
             _tick("1b_kmap_build", _t0)
             caches.kmaps[key] = kmap
         _t0 = _now()
@@ -732,7 +743,8 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
     else:
         out_stride = tuple(input.stride[k] // st[k] for k in range(3))
         tkey = (out_stride, ks, st, dl)
-        kmap = caches.kmaps.get(tkey)
+        kmap = (caches.kmaps_drop.get(tkey) if cap_enabled()
+                else None) or caches.kmaps.get(tkey)
         out_coords = caches.cmaps.get(out_stride)
         if n_out is not None:
             n_out = caches.nmaps.get(out_stride, None)   # 本层真实行数（由对应前向卷积记录）

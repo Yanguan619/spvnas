@@ -5,6 +5,7 @@ import torchsparse.nn.functional as spf
 from torchsparse import SparseTensor
 from torchsparse.nn.functional.devoxelize import calc_ti_weights
 from torchsparse.nn.utils import *
+from torchsparse.backend import unique_coords
 from torchsparse.utils import *
 from torchsparse.utils.tensor_cache import TensorCache
 import torch_scatter
@@ -34,14 +35,15 @@ def sphashquery(query, target, kernel_size=1):
         2 * target.shape[0], dtype=torch.int32, device=target.device
     )
     hashmap = torchsparse.backend.GPUHashTable(hashmap_keys, hashmap_vals)
-    hashmap.insert_coords(target[:, [1, 2, 3, 0]])
+    hashmap.insert_coords(torch.cat([target[:, 1:4], target[:, 0:1]], dim=1))
     kernel_size = make_ntuple(kernel_size, 3)
-    kernel_volume = np.prod(kernel_size)
-    kernel_size = make_tensor(kernel_size, device=target.device, dtype=torch.int32)
-    stride = make_tensor((1, 1, 1), device=target.device, dtype=torch.int32)
+    kernel_volume = int(np.prod(kernel_size))
+    # 传 python int/tuple：原来先 make_tensor 到 device、再在 lookup_coords 里
+    # .tolist() 回来，等于每层白送一次 H2D+D2H（也是入图的一个 graph break）。
     results = (
         hashmap.lookup_coords(
-            query[:, [1, 2, 3, 0]], kernel_size, stride, kernel_volume
+            torch.cat([query[:, 1:4], query[:, 0:1]], dim=1),
+            kernel_size, (1, 1, 1), kernel_volume
         )
         - 1
     )[: query.shape[0]]
@@ -56,7 +58,7 @@ def initial_voxelize(z, init_res, after_res):
     )
     # optimization TBD: init_res = after_res
     new_int_coord = torch.floor(new_float_coord).int()
-    sparse_coord = torch.unique(new_int_coord, dim=0)
+    sparse_coord = unique_coords(new_int_coord)
     idx_query = sphashquery(new_int_coord, sparse_coord).reshape(-1)
 
     sparse_feat = torch_scatter.scatter_mean(z.F, idx_query.long(), dim=0)

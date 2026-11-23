@@ -87,6 +87,53 @@ _SGG = os.environ.get("TS_SGG", "1") != "0"
 _SGG_OK = None
 
 
+def _load_cap_so(op):
+    """按需加载容量化算子的 .so（幂等）。返回该算子是否可用。
+
+    容量路径不能依赖调用方事先 import 过别的模块 —— 之前正是因为没人加载
+    keyprep_v3/query_v2，`hasattr` 判断失败后静默退回 torch 表（把补齐行也建进表），
+    导致重复键返回补齐区索引。
+    """
+    name = "spconv_" + op
+    if hasattr(torch.ops.npu, name):
+        return True
+    so = _OPS_ROOT + "/csrc/ascend/%s/op_extension/build/lib%s_ops.so" % (name, name)
+    try:
+        torch.ops.load_library(so)
+    except Exception:
+        return False
+    return hasattr(torch.ops.npu, name)
+
+
+def _load_cap_so(op):
+    """按需加载容量化算子的 .so（幂等）。返回该算子是否可用。
+
+    容量路径不能依赖调用方事先 import 过别的模块 —— 之前正是因为没人加载
+    keyprep_v3/query_v2，`hasattr` 判断失败后静默退回 torch 表（把补齐行也建进表），
+    导致重复键返回补齐区索引。
+    """
+    name = "spconv_" + op
+    if hasattr(torch.ops.npu, name):
+        return True
+    so = _OPS_ROOT + "/csrc/ascend/%s/op_extension/build/lib%s_ops.so" % (name, name)
+    try:
+        torch.ops.load_library(so)
+    except Exception:
+        return False
+    return hasattr(torch.ops.npu, name)
+
+
+_SGG2_SO = _OPS_ROOT + "/csrc/ascend/spconv_gather_gemm_v2/op_extension/build/libspconv_gather_gemm_v2_ops.so"
+_SGG2_OK = None
+
+
+def _sgg_v2_op():
+    global _SGG2_OK
+    if _SGG2_OK is None:
+        _SGG2_OK = _load_cap_so("gather_gemm_v2")
+    return _SGG2_OK
+
+
 def _sgg_op():
     global _SGG_OK
     if _SGG_OK is None:
@@ -351,6 +398,10 @@ def _fused_args(in_coords, out_coords, ks, stride, dilation):
     to compute the 27 neighbour lookups itself. Bounds mirror _lookup_offsets."""
     import torchsparse.backend as _B
 
+    if cap_enabled() and n_in is not None and n_out is not None \
+            and _load_cap_so("keyprep_v3"):
+        return _rect_map_cap(in_coords, out_coords, ks, stride, dilation, n_in, n_out)
+
     offsets = get_kernel_offsets(ks, 1, dilation, device=in_coords.device)
     if offsets.shape[0] > 32:
         return None
@@ -402,7 +453,40 @@ def _query_op():
     return _QUERY_OK
 
 
-def _rect_map(in_coords, out_coords, ks, stride, dilation):
+def _rect_map_cap(in_coords, out_coords, ks, stride, dilation, n_in, n_out):
+    """容量版邻域表：容量 buffer + device 真实行数 → nb_cap[CAP_out, kv]。
+
+    `start` 必须是 `cnt` 的**独占前缀和**（keyprep_v3 的第 2 个输出是未初始化槽位）。
+    """
+    if not _load_cap_so("keyprep_v3"):
+        raise RuntimeError("spconv_keyprep_v3 未加载（检查 UNUM_OPS_ROOT）")
+    _load_cap_so("query_v2")
+    if not _load_cap_so("keyprep_v3"):
+        raise RuntimeError("spconv_keyprep_v3 未加载（检查 UNUM_OPS_ROOT）")
+    _load_cap_so("query_v2")
+    offs = make_ntuple(ks, ndim=3)
+    offs = get_kernel_offsets(offs, 1, make_ntuple(dilation, ndim=3),
+                              device=in_coords.device).to(torch.int32)
+    st = _const_tensor(tuple(int(v) for v in stride), torch.int32, in_coords.device)
+    sz = torch.stack([n_in.reshape(()).to(torch.int32), n_out.reshape(()).to(torch.int32)])
+    rk, _unused, cn, mt = torch.ops.npu.spconv_keyprep_v3(
+        in_coords.to(torch.int32).contiguous(), out_coords.to(torch.int32).contiguous(),
+        st, offs, 0, sz)
+    start = (torch.cumsum(cn, 0) - cn).to(torch.int32)
+    q = out_coords.to(torch.int32).contiguous()
+    if hasattr(torch.ops.npu, "spconv_query_v2"):
+        nb = torch.ops.npu.spconv_query_v2(q, rk, start, cn, mt,
+                                           sz[1:2].contiguous())
+    else:
+        nb = torch.ops.npu.spconv_query(q, rk, start, cn, mt)
+    # 补齐行重复了「末行真实坐标」，因此它的键会命中补齐区；把 >= n_in 的索引
+    # 映射回被重复的真实行（末行 n_in-1），device 侧完成，无同步。
+    lim = n_in.reshape(()).to(torch.int32)
+    return torch.where(nb >= lim, lim - 1, nb)
+
+
+def _rect_map(in_coords, out_coords, ks, stride, dilation,
+              n_in=None, n_out=None):
     """[n_out, kernel_volume] neighbour indices (-1 missing) -- what the
     gather op consumes. No compaction, no host sync.
 
@@ -410,6 +494,11 @@ def _rect_map(in_coords, out_coords, ks, stride, dilation):
     itself (torchsparse's subm_hashmap_kmap_stage2 does the same on CUDA), so
     no [n_out, KV, 4] query tensor is materialised on the host."""
     import torchsparse.backend as _B
+
+    # 容量化路径：容量 buffer + device 真实行数 → 固定 CAP 行的 nb
+    if (cap_enabled() and n_in is not None and n_out is not None
+            and _load_cap_so("keyprep_v3")):
+        return _rect_map_cap(in_coords, out_coords, ks, stride, dilation, n_in, n_out)
 
     offsets = get_kernel_offsets(ks, 1, dilation, device=in_coords.device)
     if (_QUERY and in_coords.device.type == "npu" and out_coords.shape[0]
@@ -455,11 +544,12 @@ def _kernel_map(in_coords, out_coords, ks, stride, dilation):
     return src, dst, counts
 
 
-def _apply_forward(feats, weight, kmap, n_out, nb=None):
-    return _graph_call("conv_fwd", _apply_forward_eager, feats, weight, kmap, n_out, nb)
+def _apply_forward(feats, weight, kmap, n_out, nb=None, n_real=None):
+    return _graph_call("conv_fwd", _apply_forward_eager, feats, weight, kmap, n_out, nb,
+                       n_real)
 
 
-def _apply_forward_eager(feats, weight, kmap, n_out, nb=None):
+def _apply_forward_eager(feats, weight, kmap, n_out, nb=None, n_real=None):
     """out[dst] += feats[src] @ W[k]: one gather + one GEMM per group of kernel
     offsets, in-place scatter per offset."""
     cout = weight.shape[-1]
@@ -468,6 +558,11 @@ def _apply_forward_eager(feats, weight, kmap, n_out, nb=None):
             and feats.shape[1] % 8 == 0):
         ktot = weight.shape[0] * weight.shape[1]
         cin = feats.shape[1]
+        if n_real is not None and _sgg_v2_op():
+            # 容量模式：真实行数在 device 上，kernel 自己夹紧循环上界
+            return torch.ops.npu.spconv_gather_gemm_v2(
+                feats, nb, weight.reshape(ktot, cout).contiguous(),
+                n_real.reshape(1).to(torch.int32))
         if _sgg_fits(nb.shape[0], cin, cout, weight.shape[0]) and _sgg_op():
             try:
                 return torch.ops.npu.spconv_gather_gemm(
@@ -558,8 +653,13 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
         out_coords, out_stride = coords, input.stride
     elif not transposed:
         _t0 = _now()
-        out_coords = spdownsample(coords, st, ks, dl) \
-            if any(s > 1 for s in st) else coords
+        n_in = getattr(input, "n", None)
+        n_out = n_in
+        if any(s > 1 for s in st):
+            ds = spdownsample(coords, st, ks, dl, n=n_in)
+            out_coords, n_out = ds if cap_enabled() else (ds, None)
+        else:
+            out_coords = coords
         _tick("1a_spdownsample", _t0)
         key = (input.stride, ks, st, dl)
         if (_FUSED and coords.device.type == "npu" and coords.shape[0]
@@ -583,7 +683,7 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
                 if bias is not None:
                     out = out + bias
                 caches.cmaps.setdefault(out_stride, out_coords)
-                return SparseTensor(out, out_coords, out_stride, caches=caches)
+                return SparseTensor(out, out_coords, out_stride, caches=caches, n=n_out)
         op_path = (_GATHER and coords.device.type == "npu"
                    and not torch.is_grad_enabled() and _gather_op()
                    and feats.shape[1] % 8 == 0)
@@ -592,7 +692,8 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
             nb_c = caches.nbmaps.get(key)
             if nb_c is None:
                 _t0 = _now()
-                nb_c = _rect_map(coords, out_coords, ks, st, dl)
+                nb_c = _rect_map(coords, out_coords, ks, st, dl,
+                                 n_in=n_in, n_out=n_out)
                 _tick("1b_kmap_build", _t0)
                 caches.nbmaps[key] = nb_c
         kmap = caches.kmaps.get(key)
@@ -602,7 +703,7 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
             _tick("1b_kmap_build", _t0)
             caches.kmaps[key] = kmap
         _t0 = _now()
-        out = _apply_forward(feats, w, kmap, out_coords.shape[0], nb_c)
+        out = _apply_forward(feats, w, kmap, out_coords.shape[0], nb_c, n_real=n_out)
         _tick("2_conv_apply", _t0)
         out_stride = tuple(input.stride[k] * st[k] for k in range(3))
     else:
@@ -664,7 +765,7 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
     if bias is not None:
         out = out + bias
     caches.cmaps.setdefault(out_stride, out_coords)
-    return SparseTensor(out, out_coords, out_stride, caches=caches)
+    return SparseTensor(out, out_coords, out_stride, caches=caches, n=n_out)
 
 
 def calc_ti_weights(coords, idx_query, scale=1):
@@ -736,19 +837,22 @@ def cap_pad_coords(coords):
     n = torch.tensor([k], dtype=torch.int32, device=dev)
     if k == _CAP:
         return coords.contiguous(), n
-    sent = torch.full((_CAP - k, coords.shape[1]), _SENTINEL,
-                      dtype=coords.dtype, device=dev)
-    sent[:, 0] = 0
-    return torch.cat([coords, sent], 0).contiguous(), n
+    # 补齐行 = **重复末行有效坐标**（不能用极端哨兵值：那会把 keyprep 的包围盒/
+    # 内置归约打崩，实测触发 507035 vector core exception；重复有效行既不扩包围盒，
+    # 也只会产生"已存在的键"，对查询无副作用）
+    tail = coords[-1:].repeat(_CAP - k, 1)
+    return torch.cat([coords, tail], 0).contiguous(), n
 
 
 def cap_refill_sentinel(coords_cap, u):
-    """dedup 之后：kernel 输出的尾部行是未定义的，必须重填成哨兵（device 侧，无同步）。"""
+    """dedup 之后：kernel 输出的尾部行是未定义的，必须重填（device 侧，无同步）。
+
+    重填值用 **行 0（必为真实体素）的重复**，不用极端哨兵：极端值会打崩内置归约。
+    尾部是"已存在的键"的重复，所以不会给后续查询引入新键。
+    """
     dev = coords_cap.device
     keep = (torch.arange(_CAP, device=dev) < u.reshape(())).unsqueeze(1)
-    sent = torch.full_like(coords_cap, _SENTINEL)
-    sent[:, 0] = 0
-    return torch.where(keep, coords_cap, sent)
+    return torch.where(keep, coords_cap, coords_cap[0:1])
 _DEVOX_SO = {
     "1": (_OPS_ROOT + "/csrc/ascend/spconv_devox/op_extension/build/libspconv_devox_ops.so"),
     "2": (_OPS_ROOT + "/csrc/ascend/spconv_devox_v2/op_extension/build/libspconv_devox_v2_ops.so"),

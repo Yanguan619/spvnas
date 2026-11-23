@@ -61,7 +61,7 @@ def run(model, n_pts, reps=1):
 
 # 参考（eager）
 ref = {}
-for np_ in (20000, 12000):
+for np_ in (20000, 12000, 6000):
     ref[np_] = run(m, np_)[0]
     print("[ref] %d 点 eager 完成" % np_, flush=True)
 
@@ -76,8 +76,13 @@ y12, t12 = run(mc, 12000)
 second_s = time.time() - t0
 print("[run] 12k 首跑耗时 %.1f s（若≈编译耗时说明重编了）" % second_s, flush=True)
 
+t0 = time.time()
+y6, t6 = run(mc, 6000)
+third_s = time.time() - t0
+print("[run] 6k  首跑耗时 %.1f s" % third_s, flush=True)
+
 ok = True
-for np_, y in ((20000, y20), (12000, y12)):
+for np_, y in ((20000, y20), (12000, y12), (6000, y6)):
     d = float(np.abs(ref[np_] - y).max())
     ag = float((ref[np_].argmax(1) == y.argmax(1)).mean()) * 100
     good = d < 1e-4 and ag > 99.99
@@ -85,9 +90,10 @@ for np_, y in ((20000, y20), (12000, y12)):
     print("  %-6d 点: max|d|=%.3e argmax=%.4f%%  %s" % (np_, d, ag, "PASS" if good else "FAIL"),
           flush=True)
 
-print("  ['一张图'判据] 12k 首跑 %.1f s vs 20k 首跑 %.1f s → %s"
-      % (second_s, compile_s,
-         "PASS（未重编）" if second_s < 0.5 * compile_s else "FAIL（疑似重编）"), flush=True)
-ok &= second_s < 0.5 * compile_s
+print("  ['一张图'判据] 12k %.1f s / 6k %.1f s vs 编译 %.1f s → %s"
+      % (second_s, third_s, compile_s,
+         "PASS（均未重编）" if max(second_s, third_s) < 0.5 * compile_s
+         else "FAIL（疑似重编）"), flush=True)
+ok &= max(second_s, third_s) < 0.5 * compile_s
 print("\n总体:", "全部 PASS" if ok else "有 FAIL")
 sys.exit(0 if ok else 1)

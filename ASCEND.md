@@ -90,6 +90,17 @@ python demo.py --cr 0.5
 > 想拿 eager 的 3.9× 需要完整算子库（`spconv_devox_v4`、`spconv_gather` 等），
 > 见 `unum_ops` 主库；换 torch 版本时 `.so` 需按对应 torch 重编（ABI 不匹配会回退，结果仍正确）。
 
+## 4b. 两个免费的性能开关（实测）
+
+```bash
+# 一级流水任务队列：20k 档 -32%，94k 档 -8%
+export TASK_QUEUE_ENABLE=2
+# 内存池扩展段（长跑/大帧更稳）
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+```
+
+> `TASK_QUEUE_ENABLE=2` 与"入图"互斥（入图时不要开）。更多调优结论见 [TUNING.md](TUNING.md)。
+
 ## 5. 图模式（可选，需 torch ≥ 2.14）
 
 本后端同时支持 `torch.compile` 的三种图模式（aclgraph / GE 静态 / GE 动态）。要点：

@@ -121,7 +121,7 @@ GM_MODE=ge GM_DYN=1 python demo.py --cr 0.5
 | eager（+unum_ops） | 73.7 | — |
 | aclgraph（npugraph_ex） | 27.5 | `max｜d｜`=1.5e-08 |
 | GE 静态（分段） | **15.2** | 逐段 0 |
-| GE 动态（任意形状） | 36.8 | 5.96e-08 |
+| GE 动态（每形状冻结一次） | 36.8 | 5.96e-08 |
 
 图模式细节与坑位见我们另一份文档（`unum_ops` 仓库的 `ge.md` / `docs/spvnas/GRAPH_MODE_MATRIX.md`）。
 纯 torch 路径**不需要**这些环境变量。
@@ -154,3 +154,11 @@ m = torch.compile(m, backend=torchair.get_npu_backend(), dynamic=True)   # GE �
 3. **大帧性能**：纯 torch 路径是「op 数量受限」的（一帧约 800 个小 op），
    这也是为什么加载 unum_ops 能到 3.9×；不加载时请预期 3–4 倍差距。
 4. `demo_spvcnn.pt`（22 MB 权重）未随仓库分发，跑精度复现时自行准备。
+
+> ⚠️ **「任意形状」的准确口径**：上表 6 档（20k/94k × cr 0.25/0.5/1.0）都实测跑通且结果正确，
+> 但**每个形状需要一次 `TS_FG=record/replay` 冻结**（模型里有几处数据相关常量要读回 host，
+> 占位后图才编得出来），所以实际能力是「**每形状冻结一次**」，
+> **不是**「一次编译、任意 N、不重录」。
+> 真正的零重录需要把 conv 链切成容量化算子（输出定长 CAP + device 侧 `n`），
+> 该链路目前卡在 `spconv_keyprep_v3`（`start`/`cnt` 输出全 0），见 `csrc/ascend/README.md §7`。
+

@@ -80,7 +80,10 @@ python demo.py --cr 0.5
 | eager，完整 unum_ops 库 | 73.7 ms |
 | aclgraph（+完整库） | 27.5 ms |
 | GE 静态分段（+完整库） | 15.2 ms |
-| GE 动态（+完整库，任意形状） | 36.8 ms |
+| GE 动态（+完整库，每形状冻结一次） | 36.8 ms |
+
+> 该行是**逐形状**实测；每个形状需一次 `TS_FG=record/replay` 冻结（模型里仍有 host 读回），
+> 不是「一次编译吃任意 N」。零重录依赖容量化算子，当前卡在 `keyprep_v3`，见 §7。
 
 > 只装固定行数版时 eager 几乎不提速：默认启发式把大层排除在 `spconv_gather_gemm` 之外，
 > eager 的时间大头是 devox / 邻域聚合的 torch 实现。真正的收益在图模式

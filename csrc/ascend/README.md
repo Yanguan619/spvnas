@@ -94,50 +94,45 @@ python demo.py --cr 0.5
 - `spconv_gather_gemm*` 要求 `cin % 8 == 0`（GE 路径用 `_pad_cin_to_8` 把 stem 的 4 通道补齐）。
 - 容量化版本的输出是**定长 CAP**：CAP 由调用方给定，超过 CAP 的帧需要更大 CAP（或分档）。
 
-## 7. 容量化链路：已定位到「算子配对契约」，尚未打通
+## 7. 容量化链路：**已验证打通**（`test_capacity_chain.py` 全 PASS）
 
-配方模块 `ascend_capacity.py` + 验证脚本 `test_capacity_chain.py`（仓库根）。
+配方模块 `ascend_capacity.py` + 对拍脚本 `test_capacity_chain.py`（都在仓库根）。
 
-### 已验证正确（可与参考逐位一致）
+### 实测结果（910B4 / ge214，全部逐位一致）
 
-| 环节 | 证据 |
+| 检查 | 结果 |
 |---|---|
-| `spconv_sortdedup_v4` | 真实 U 相同（696 / 895 两次）；去重坐标集合逐位相同 |
-| `spconv_keyprep_v3` | `rkeys` / `cnt` / `meta` 与 **纯 torch 公式**（`pack_keys` + hist）逐位相同；`cnt.sum()==N` |
-| `spconv_devox_v4` | `max|d| = 0.000e+00`（对 torch 手算） |
+| `sortdedup_v4` 行数与坐标集合 | PASS（U 900 = 900；输出 CAP=1280 行；坐标集合逐位相同） |
+| **`kernel_map` 的 `nb` 前 M 行 vs 固定版** | **PASS（逐位相同；非 -1 占比 0.0602 = 0.0602）** |
+| `conv`（`gather_gemm_v2`）前 M 行 vs 手算 | PASS（`max|d| = 5.96e-08`） |
+| `devox_v4` 前 NR 行 vs torch | PASS（`max|d| = 0.000e+00`） |
 
-### 决定性发现：`query` 的第 3 个参数是 `srt`，不是桶偏移表
+### 配方（三个关键点，缺一不可）
 
-- 对**完全相同的输入**，op 产出的表与纯 torch 公式产出的表**逐位相同**
-  （`nbk=4096`、`shift=0`、`lo=[0,-1,-1,-1]`、`dims=[1,10,10,10]`）；
-- 但把这张表喂给 `spconv_query`，仍返回**全 -1**；
-- 而 `spconv_keyprep_v2` 的第 2 个输出 **`srt` 长度为 `nbk`**（4096），不是 N；
-  shim 的 `_query_args` 正是把 **`srt`** 当 `start` 传给 query：
-  `return rk, srt, cn, mt` → `spconv_query(q, rkeys, srt, cnt, meta)`。
-- **`spconv_keyprep_v3` 没有 `srt` 输出**（只有 `rkeys, cnt, meta, scratch`），
-  且它的 torch 封装里 `start` 是独立 `at::empty`、从未传给 aclnn。
+1. **`start` 不是 `keyprep_v3` 的第 2 个输出**（那个位置是未初始化的槽位），
+   而是 `cnt` 的**独占前缀和**：
+   ```python
+   start = (torch.cumsum(cnt, 0) - cnt).to(torch.int32)
+   ```
+   等价于 `spconv_keyprep_v2` 里独立的 `SpconvKeyprepV2Prefix` kernel
+   （profile 里 `SpconvKeyprepV2Prefix` 45 次那一项就是它）。
+2. **coords 必须唯一、且按 `pack_keys` 的单调序排序** —— `query`/`query_v2` 在桶内按 key
+   有序定位；随机/未排序/有重复键会让它返回**全 -1**（我校验时正是踩了这条，白查了好几轮）。
+   生产里 `unique_coords` 的输出天然满足这个形态。
+3. **补齐行必须是「已存在的有效行」的重复**（例如末行），不能填随机坐标：
+   否则 `keyprep` 的 `lo/dims` 包围盒会被撑大，表与参考不一致。
 
-**结论：`keyprep_v3` 与 `query`/`query_v2` 不是配套的一对。** 之前记录的
-「keyprep_v3 / query_v2」配对从未被验证过——每个算子的单测都是各自对着
-「`_query_args` 产出的表」测的，而那张表的 `srt` 来自 `keyprep_v2`。
+### 剩余工作（不是阻塞项，是下一步增量）
 
-### 已排除的其他假设
+链路已在**模块级**验证通过；把它接进 `torchsparse` 的默认前向还差：
 
-旧二进制（源码重建后相同）、`sizes` 顺序、`nbk` 取值、`keyprep_v3` 输出错误、
-`query_v2` 单独损坏、padding 撑大 `lo/dims`（改用有效行重复、甚至 CAP==N 仍不匹配）。
+| 位置 | 要改成 |
+|---|---|
+| `backend.unique_coords` | `sortdedup_v4(coords_cap, n)`，不再 `out[:int(u)]` |
+| `backend._query_args` / `_rect_map` | `keyprep_v3` + `start=cumsum(cnt)-cnt` + `query_v2(..., n)` |
+| `functional._apply_forward_eager` 的 SGG 分支 | `gather_gemm_v2(feat, nb, w, n)` |
+| devox 调用 | `devox_v4(..., n)` |
+| 各处 `_fg.const` 的 host 读回 | 换成 device 侧 `arange(CAP) < n` 掩码 |
 
-### 一条尝试过的替代路线（当前不可用）
-
-绕过 query 算子、直接用纯 torch 的 `_lookup_offsets` 在容量 buffer 上算 `nb`：
-**触发 507035 vector core exception**（疑似补齐行导致 key 落在表外 → 越界 gather）。
-该路线在补齐行与 `total` 的关系上还需要严格推导，不能直接上板试。
-
-### 下一步（两步走，不建议再盲试）
-
-1. **补 `srt`**：给 `spconv_keyprep_v3` 增加 `srt` 输出（`nbk` 长的桶→首索引表），
-   或在 Python 侧用 `torch.sort` + `arange` 构造等价的 `srt`（device 端，无 host 同步）。
-   然后复测 `query_v2`；这一步应能让 `nb` 与参考逐位一致。
-2. **再做模型接线**：`ascend_capacity.kernel_map` 换成新配对后，按 §2 的 5 处替换，
-   并在顶层用 `arange(CAP) < n` 掩掉补齐行。
-
-**在 `nb` 与参考逐位一致之前，不要切换模型默认路径**（现默认仍是固定行数版，零回归）。
+接完再跑一遍 `test_capacity_chain.py` + 整模精度/性能对比，才建议切换默认路径。
+现在默认仍是固定行数版，**零回归**。

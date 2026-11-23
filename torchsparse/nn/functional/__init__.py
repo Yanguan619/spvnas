@@ -885,9 +885,45 @@ _CAP_NBK = 1
 while _CAP_NBK < 4 * max(_CAP, 1):
     _CAP_NBK <<= 1
 
+# 容量档位（分档用）：默认 3 档。TS_CAP_BUCKETS="8192,16384,20480" 可覆盖。
+_CAP_BUCKETS = tuple(
+    int(x) for x in (os.environ.get("TS_CAP_BUCKETS") or "8192,16384,20480").split(",")
+    if x.strip())
+
 
 def cap_enabled():
     return _CAP > 0
+
+
+def cap_size():
+    return _CAP
+
+
+def set_cap(cap):
+    """切换容量档位（分档用）。每个 CAP 值对应一张编译好的图：
+    torch.compile/torchair 会对模块全局 `_CAP` 加 guard，改值即触发重编，
+    所以「按点数选桶」= 每个桶只编译一次。"""
+    global _CAP, _CAP_NBK
+    cap = int(cap)
+    if cap == _CAP:
+        return _CAP
+    if cap <= 0:
+        raise ValueError("set_cap 需要正数")
+    _CAP = cap
+    nbk = 1
+    while nbk < 4 * max(cap, 1):
+        nbk <<= 1
+    _CAP_NBK = nbk
+    return _CAP
+
+
+def cap_for(n, buckets=None):
+    """返回能装下 n 个点的最小档位；超出最大档则报错（提示调大档位）。"""
+    bs = tuple(int(b) for b in (buckets or _CAP_BUCKETS))
+    for b in sorted(bs):
+        if n <= b:
+            return b
+    raise RuntimeError("点数 %d 超过最大容量档 %d，请加入更大的档位" % (n, max(bs)))
 
 
 # 容量模式下强制 device-only 的转置路径：`_compact_from_nb` 用 nonzero/tolist 在

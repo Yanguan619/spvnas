@@ -284,7 +284,8 @@ def _table_fill(total, in_coords, mins, dims, device):
     if prev is not None:
         table[prev] = -1
     keys = pack_keys(in_coords, mins, dims)
-    table[keys] = torch.arange(in_coords.shape[0], dtype=torch.int32, device=device)
+    table[keys] = torch.arange(in_coords.shape[0] - 1, -1, -1, dtype=torch.int32,
+                               device=device)
     _TABLES[total] = [table, keys]
     return table
 
@@ -479,10 +480,9 @@ def _rect_map_cap(in_coords, out_coords, ks, stride, dilation, n_in, n_out):
                                            sz[1:2].contiguous())
     else:
         nb = torch.ops.npu.spconv_query(q, rk, start, cn, mt)
-    # 补齐行重复了「末行真实坐标」，因此它的键会命中补齐区；把 >= n_in 的索引
-    # 映射回被重复的真实行（末行 n_in-1），device 侧完成，无同步。
+    # nb 的值是**输入特征的行号**：补齐行不存在 → 丢弃为 -1（不能折回末行）
     lim = n_in.reshape(()).to(torch.int32)
-    return torch.where(nb >= lim, lim - 1, nb)
+    return torch.where(nb >= lim, torch.full_like(nb, -1), nb)
 
 
 def _rect_map(in_coords, out_coords, ks, stride, dilation,
@@ -524,13 +524,20 @@ def _compact_from_nb(nb):
                       ("counts_nb", tuple(nb.shape))))
 
 
-def _kernel_map(in_coords, out_coords, ks, stride, dilation):
+def _kernel_map(in_coords, out_coords, ks, stride, dilation, n_in=None):
     """Compacted neighbour pairs, grouped by kernel offset.
 
     One selection over the whole [kernel_volume, n_out] matrix (offset-major)
     instead of compare + nonzero + two gathers per offset."""
     offsets = get_kernel_offsets(ks, 1, dilation, device=in_coords.device)
     idx = _lookup_offsets(in_coords, out_coords, stride, offsets)   # [n_out, kv]
+    if n_in is not None and cap_enabled():
+        # 补齐行是**不存在的输入行**：这些条目必须**丢弃**（-1），不能折回末行。
+        # 折回会把 padding 的 fine 行全部指到 n_fine-1，而转置卷积按
+        # out[src_fine] += feats[dst_coarse] 累加 → 真实末行被灌入几百次（实测爆到 1e5）。
+        # 越界值（哈希表对缺失键可能返回）一并丢弃，避免 OOB。
+        lim = n_in.reshape(()).to(idx.dtype)
+        idx = torch.where(idx >= lim, torch.full_like(idx, -1), idx)
     n_out, kv = idx.shape
     flat = idx.T.reshape(-1)                                       # offset-major
     valid = flat >= 0
@@ -559,10 +566,16 @@ def _apply_forward_eager(feats, weight, kmap, n_out, nb=None, n_real=None):
         ktot = weight.shape[0] * weight.shape[1]
         cin = feats.shape[1]
         if n_real is not None and _sgg_v2_op():
-            # 容量模式：真实行数在 device 上，kernel 自己夹紧循环上界
-            return torch.ops.npu.spconv_gather_gemm_v2(
+            # 容量模式：真实行数在 device 上，kernel 自己夹紧循环上界。
+            # kernel 只写前 n 行，其余是 **未初始化内存** —— 必须置零，否则下游 BN/conv
+            # 会读到随机位并放大成 1e20 量级的垃圾（实测过）。
+            res = torch.ops.npu.spconv_gather_gemm_v2(
                 feats, nb, weight.reshape(ktot, cout).contiguous(),
                 n_real.reshape(1).to(torch.int32))
+            keep = (torch.arange(res.shape[0], device=res.device)
+                    < n_real.reshape(())).unsqueeze(1)
+            return torch.where(keep, res,
+                               torch.zeros((), dtype=res.dtype, device=res.device))
         if _sgg_fits(nb.shape[0], cin, cout, weight.shape[0]) and _sgg_op():
             try:
                 return torch.ops.npu.spconv_gather_gemm(
@@ -640,6 +653,15 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
 
     feats, coords = input.F, input.C
     caches = input._caches
+    # 容量模式：真实行数随 SparseTensor 传入；所有分支都需要它（尾部 return 用）
+    n_in = getattr(input, "n", None)
+    n_out = n_in
+    # 全局不变量：补齐行的特征一律视为 0。映射层怎么绕都不会把 padding 值放大进真实行。
+    if n_in is not None and cap_enabled():
+        _keep = (torch.arange(feats.shape[0], device=feats.device)
+                 < n_in.reshape(())).unsqueeze(1)
+        feats = torch.where(_keep, feats,
+                            torch.zeros((), dtype=feats.dtype, device=feats.device))
     # cin 不是 8 的倍数（stem 第一层 Conv3d(4, ...)）时补零到 8 的倍数，
     # 让 _GATHER 快路径（spconv_gather_gemm）生效；多余通道输入/权重都是 0，结果等价。
     # _pad_cin_to_8 只在 GE 兼容模式下启用：它会把 stem 从 `_kernel_map` 切到 SGG 快路径，
@@ -653,8 +675,6 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
         out_coords, out_stride = coords, input.stride
     elif not transposed:
         _t0 = _now()
-        n_in = getattr(input, "n", None)
-        n_out = n_in
         if any(s > 1 for s in st):
             ds = spdownsample(coords, st, ks, dl, n=n_in)
             out_coords, n_out = ds if cap_enabled() else (ds, None)
@@ -699,18 +719,23 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
         kmap = caches.kmaps.get(key)
         if kmap is None:
             _t0 = _now()
-            kmap = None if op_path else _kernel_map(coords, out_coords, ks, st, dl)
+            kmap = (None if op_path
+                    else _kernel_map(coords, out_coords, ks, st, dl, n_in=n_in))
             _tick("1b_kmap_build", _t0)
             caches.kmaps[key] = kmap
         _t0 = _now()
         out = _apply_forward(feats, w, kmap, out_coords.shape[0], nb_c, n_real=n_out)
         _tick("2_conv_apply", _t0)
         out_stride = tuple(input.stride[k] * st[k] for k in range(3))
+        if n_out is not None:
+            caches.nmaps.setdefault(out_stride, n_out)   # 容量模式：供转置卷积取真实行数
     else:
         out_stride = tuple(input.stride[k] // st[k] for k in range(3))
         tkey = (out_stride, ks, st, dl)
         kmap = caches.kmaps.get(tkey)
         out_coords = caches.cmaps.get(out_stride)
+        if n_out is not None:
+            n_out = caches.nmaps.get(out_stride, None)   # 本层真实行数（由对应前向卷积记录）
         if kmap is None:
             nb_t = caches.nbmaps.get(tkey)
             if nb_t is None and _FUSED and _fused_op() and out_coords is not None:
@@ -852,7 +877,11 @@ def cap_refill_sentinel(coords_cap, u):
     """
     dev = coords_cap.device
     keep = (torch.arange(_CAP, device=dev) < u.reshape(())).unsqueeze(1)
-    return torch.where(keep, coords_cap, coords_cap[0:1])
+    # 统一约定：补齐/重填行 = **最后一行的重复**（与 cap_pad_coords 一致），
+    # 这样各处 clamp「>= n → n-1」都能正确指回被重复的真实行。
+    j = (u.reshape(()).to(torch.long) - 1).clamp(min=0)
+    tail = torch.gather(coords_cap, 0, j.expand(1, coords_cap.shape[1]))
+    return torch.where(keep, coords_cap, tail)
 _DEVOX_SO = {
     "1": (_OPS_ROOT + "/csrc/ascend/spconv_devox/op_extension/build/libspconv_devox_ops.so"),
     "2": (_OPS_ROOT + "/csrc/ascend/spconv_devox_v2/op_extension/build/libspconv_devox_v2_ops.so"),

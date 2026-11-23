@@ -11,6 +11,7 @@ class TensorCache:
         self.cmaps = {}
         self.fusedmaps = {}
         self.nbmaps = {}
+        self.nmaps = {}      # stride -> 该层真实行数（容量模式，供转置卷积取用）
 
 
 __all__ = ["TensorCache"]

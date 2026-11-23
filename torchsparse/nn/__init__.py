@@ -12,7 +12,8 @@ __all__ = ["Conv3d", "BatchNorm", "ReLU", "functional"]
 
 
 def _wrap(feats, tensor):
-    return SparseTensor(feats, tensor.C, tensor.s, caches=tensor._caches)
+    return SparseTensor(feats, tensor.C, tensor.s, caches=tensor._caches,
+                        n=getattr(tensor, "n", None))
 
 
 @torch.no_grad()

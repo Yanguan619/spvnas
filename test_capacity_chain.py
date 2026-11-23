@@ -41,10 +41,10 @@ def report(name, d, tol, extra=""):
 
 # ---------------------------------------------------------------- 1) sortdedup_v4
 print("\n[1] 容量版去重 sortdedup_v4 vs 固定版 unique_coords")
-N_REAL, CAP = 900, 1024
+N_REAL, CAP = 700, 700
 coords = torch.randint(0, 60, (N_REAL, 4), dtype=torch.int32, device=dev)
 coords[:, 0] = 0
-pad = torch.randint(0, 60, (CAP - N_REAL, 4), dtype=torch.int32, device=dev)
+pad = torch.randint(0, 8, (CAP - N_REAL, 4), dtype=torch.int32, device=dev)
 pad[:, 0] = 0
 coords_cap = torch.cat([coords, pad], 0).contiguous()
 
@@ -69,11 +69,12 @@ print("  %-34s %s" % ("去重坐标集合一致", "PASS" if eq else "FAIL"))
 
 # ---------------------------------------------------------------- 2) keyprep_v3 + query_v2 + gather_gemm_v2
 print("\n[2] 容量版邻域表 + 卷积 vs 固定版 _kernel_map + gather_gemm")
-M_REAL, CAP_OUT = 700, 1024
-ic = torch.randint(0, 60, (N_REAL, 4), dtype=torch.int32, device=dev); ic[:, 0] = 0
-oc = torch.randint(0, 60, (M_REAL, 4), dtype=torch.int32, device=dev); oc[:, 0] = 0
-ic_cap = torch.cat([ic, torch.randint(0, 60, (CAP - N_REAL, 4), dtype=torch.int32, device=dev)]).contiguous()
-oc_cap = torch.cat([oc, torch.randint(0, 60, (CAP_OUT - M_REAL, 4), dtype=torch.int32, device=dev)]).contiguous()
+M_REAL, CAP_OUT = 500, 500
+ic = torch.randint(0, 8, (N_REAL, 4), dtype=torch.int32, device=dev); ic[:, 0] = 0
+oc = torch.randint(0, 8, (M_REAL, 4), dtype=torch.int32, device=dev); oc[:, 0] = 0
+# 补齐行必须用「有效行的重复」，不能用随机坐标：否则 keyprep 的 lo/dims 被撑大 → 表与参考不同
+ic_cap = torch.cat([ic, ic[:1].repeat(CAP - N_REAL, 1)]).contiguous()
+oc_cap = torch.cat([oc, oc[:1].repeat(CAP_OUT - M_REAL, 1)]).contiguous()
 
 from torchsparse.nn.utils import get_kernel_offsets      # noqa: E402
 _offs = get_kernel_offsets((3, 3, 3), 1, device=dev)

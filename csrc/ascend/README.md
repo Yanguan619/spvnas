@@ -94,31 +94,39 @@ python demo.py --cr 0.5
 - `spconv_gather_gemm*` 要求 `cin % 8 == 0`（GE 路径用 `_pad_cin_to_8` 把 stem 的 4 通道补齐）。
 - 容量化版本的输出是**定长 CAP**：CAP 由调用方给定，超过 CAP 的帧需要更大 CAP（或分档）。
 
-## 7. 已知问题（容量化链路的验证进度）
+## 7. 容量化链路的验证进度（当前唯一阻塞项）
 
 配方模块 `ascend_capacity.py` + 验证脚本 `test_capacity_chain.py`（仓库根）用于对拍
-「容量化路径 vs 固定行数路径」。当前结果：
+「容量化路径（定长 CAP + device `n`）」与「固定行数路径」。
 
 | 环节 | 状态 | 证据 |
 |---|---|---|
-| `spconv_sortdedup_v4` | ✅ 一致 | 真实 U 相同（895）；去重后的坐标集合逐位相同 |
-| `spconv_devox_v4` | ✅ 一致 | `max|d| = 0.000e+00`（对 torch 手算参考） |
-| `spconv_keyprep_v3` → `spconv_query_v2` | ❌ 未通 | `keyprep_v3` 的 `start`/`cnt` 输出**全 0** → `query_v2` 返回 nb 全 `-1`（固定版该输入非 -1 占比 57.6%） |
+| `spconv_sortdedup_v4` | ✅ 一致 | 真实 U 相同（696/895 两种取法都对）；去重坐标集合逐位相同 |
+| `spconv_devox_v4` | ✅ 一致 | `max|d| = 0.000e+00`（对 torch 手算） |
+| `spconv_keyprep_v3` | ✅ 单个算子正确 | 与 shim 的参考实现（`_query_args`）逐位相同：`rkeys` / `cnt` / `meta` / `start = cumsum(cnt)-cnt` 全部相同；`cnt.sum() == N` |
+| **邻域表整链**（keyprep → query） | ❌ **未通** | `nb` 与参考逐位不同 → conv 差 0.28 |
 
-已排除的原因：
+### 已排除的假设（每条都做了实验）
 
-- **不是旧二进制**：用本目录源码重建这 5 个算子后重测，结果完全相同；
-- **不是 `sizes` 顺序**：`[n, m]` 与 `[m, n]` 都试过（后者仅 0.07% 非 -1）；
-- **不是 `nbk`**：`0` / `8192` / `32768` 都试过，均全 0。
+1. ~~旧二进制~~：用本目录源码重建 5 个算子（5/5 `rc=0`）后结果相同。
+2. ~~`sizes` 顺序~~：`[n,m]` 与 `[m,n]` 都试过（后者只有 0.07% 非 -1）。
+3. ~~`nbk`~~：`0` / `8192` / `32768` 都试过。
+4. ~~`keyprep_v3` 输出错~~：见上表——与参考逐位相同。
+5. ~~`query_v2` 自身坏~~：强制改用固定版 `spconv_query`（v1）跑容量 buffer，**仍然不匹配**
+   → 问题不在 `query_v2` 这一个算子，而在「keyprep 产出的表」与「query 期望的表」之间的
+   **配对参数**（`meta[0]` 里的 `shift` 与 `start.numel()` 即 `nbk` 是否与参考路径一致）。
+6. ~~padding 污染包围盒~~：padding 从随机坐标改为「有效行重复」后仍不匹配（且 `CAP == N`
+   完全无 padding 时也不匹配），所以不是 padding 撑大 `lo/dims`。
 
-下一步（需要读 kernel 源码）：
+### 下一步（精确到变量）
 
-1. `op_kernel/spconv_key_prep_v3.cpp` 里确认 `start` 是否由 aclnn 真正写出。
-   当前 `op_extension/spconv_keyprep_v3_torch.cpp` 的注释写明 aclnn 输出顺序是
-   「`rkeys, cnt, meta, scratch`」，而 `start` 是另行 `at::empty({nbk})` 创建的
-   —— **怀疑 `start` 从未被 kernel 写入**（表现为全 0）。
-2. 若确实如此，两选一：把 `start` 加进 aclnn 输出列表，或在 Python 侧用
-   `torch.cumsum(cnt)` 自己算前缀和（后者不用改 kernel，代价是一次 device 端 scan）。
-3. 修好后 `test_capacity_chain.py` 的 [2] 段应转 PASS，随后再做模型级接线。
+在同一次运行里同时打印两条路径的 **`meta[0]`（shift）与 `start.numel()`（nbk）**：
 
-在 [2] 转 PASS 之前，**不要把模型默认路径切到容量化算子**。
+- 参考路径：`torchsparse.backend._query_args(...)`（注意它会走 op 分支或 torch 分支，分支不同
+  `nbk` 公式相同但 `total`/`shift` 来源不同）；
+- 容量路径：`ascend_capacity.kernel_map(...)`（`nbk=0` 时由 wrapper 自己算）。
+
+若 `nbk`/`shift` 不一致 → 在 `kernel_map` 里对齐（把参考路径的 `nbk` 显式传进去）即可；
+若一致仍不匹配 → 是 `query` 家族算子与 Python 侧表构造的**桶函数不parity**，需要改 kernel。
+
+**在 `nb` 与参考逐位一致之前，不要切换模型默认路径**（现默认仍是固定行数版，零回归）。

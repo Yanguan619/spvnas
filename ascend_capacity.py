@@ -37,11 +37,18 @@ import os
 
 import torch
 
+# 调试开关：强制走 v1 query 绕行
+_FORCE_Q1 = os.environ.get("TS_CAP_QUERY_V1", "") == "1"
+
 __all__ = ["load", "available", "n_scalar", "valid_mask", "unique_coords_cap",
            "kernel_map", "conv", "devox"]
 
 _REQUIRED = ("spconv_sortdedup_v4", "spconv_keyprep_v3", "spconv_query_v2",
              "spconv_gather_gemm_v2", "spconv_devox_v4")
+
+# 容量链里 query 的绕行实现：query_v2 与 keyprep_v3/torch 的表不匹配（见 README §7），
+# 改用固定版 spconv_query 直接跑容量 buffer（补齐行结果会被调用方掩掉）。
+_QUERY_FALLBACK = ("spconv_query",)
 
 
 def load(ops_root=None, quiet=True):
@@ -49,7 +56,7 @@ def load(ops_root=None, quiet=True):
     root = ops_root or os.environ.get("UNUM_OPS_ROOT", "")
     if not root:
         return False
-    for op in _REQUIRED:
+    for op in _REQUIRED + _QUERY_FALLBACK:
         if hasattr(torch.ops.npu, op):
             continue
         so = os.path.join(root, "csrc", "ascend", op, "op_extension", "build",
@@ -108,9 +115,15 @@ def kernel_map(ic_cap, oc_cap, sizes, ks=3, stride=1, dilation=1, nbk=0, dev=Non
     rk, st, cn, mt = torch.ops.npu.spconv_keyprep_v3(
         ic_cap.to(torch.int32).contiguous(), oc_cap.to(torch.int32).contiguous(),
         s_st, offs, int(nbk), s_sz)
-    nb = torch.ops.npu.spconv_query_v2(
-        oc_cap.to(torch.int32).contiguous(), rk, st, cn, mt, s_sz[1:2].contiguous())
-    return nb
+    q = oc_cap.to(torch.int32).contiguous()
+    if hasattr(torch.ops.npu, "spconv_query_v2") and not _FORCE_Q1:
+        nb = torch.ops.npu.spconv_query_v2(q, rk, st, cn, mt, s_sz[1:2].contiguous())
+        if bool((nb[: int(sizes[1])] >= 0).any()):
+            return nb
+    # 绕行：v1 query 直接吃容量 buffer（没有 n 参数，多算补齐行，结果由调用方掩掉）
+    if hasattr(torch.ops.npu, "spconv_query"):
+        return torch.ops.npu.spconv_query(q, rk, st, cn, mt)
+    raise RuntimeError("neither spconv_query_v2 nor spconv_query works")
 
 
 def conv(feats, nb_cap, weight, n_out, dev=None):

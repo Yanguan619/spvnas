@@ -50,25 +50,45 @@ python demo.py --cr 0.25
 `1.29e-05` 是 fp32 累加顺序差异（logits 幅值约 14.6，相对误差 ~9e-7），
 **argmax 100% 一致**，判别结果完全相同。
 
-## 4. 可选加速：unum_ops（3.9×）
+## 4. AscendC 算子（自带 4 个，可选）
 
-`unum_ops` 是配套的 AscendC 算子库（`csrc/ascend/spconv_*`，含 sparse conv gather/gemm、
-去重、查询、devox 等）。**不装也能跑**，装了才加速：
+本仓库自带 `csrc/ascend/`，里面是**本次 GE 动态图适配中真正被执行的 4 个算子**
+（依据：GE 动态 profile 里的 `Spconv*` kernel 计数）：
+
+| 算子 | kernel | 每迭代调用 |
+|---|---|---:|
+| `spconv_sortdedup_v3` | `SpconvSortDedupV3` | 15 |
+| `spconv_keyprep_v2` | `SpconvKeyprepV2(+Prefix)` | 45 + 45 |
+| `spconv_query` | `SpconvQuery` | 45 |
+| `spconv_gather_gemm` | `SpconvGatherGemm` | 114 |
+
+构建（CANN 已 source、torch ≥ 2.14 需 C++20，CMakeLists 已设好）：
 
 ```bash
-export UNUM_OPS_ROOT=/path/to/unum_ops      # 指向 unum_ops 仓库根目录
-python demo.py --cr 0.5 --iters 10
+bash csrc/ascend/spconv_gather_gemm/build.sh          # 每个算子独立构建
+export UNUM_OPS_ROOT=$PWD                              # 指向本仓库根即可被自动发现
+python demo.py --cr 0.5
 ```
 
-实测（同权重同帧，20,000 点，cr=0.5，10 次取中位数）：
+**不构建也完全可用**（自动回退纯 torch）。
 
-| 配置 | eager 前向 | 相对零依赖 |
-|---|---:|---:|
-| 纯 torch（零依赖） | **288.6 ms** | 1.00× |
-| + unum_ops | **73.7 ms** | **3.9×** |
+实测（同权重同帧，20,000 点，cr=0.5，10 次中位数）：
 
-> 换 torch 版本时，`UNUM_OPS_ROOT` 指向**用对应 torch 编译的那份 unum_ops 构建**
-> （`.so` 与 torch ABI 不匹配会 `load_library` 失败，此时自动回退纯 torch，行为仍正确）。
+| 配置 | eager 前向 | 说明 |
+|---|---:|---|
+| 纯 torch（默认） | 288.6 ms | 零依赖 |
+| **仅自带这 4 个算子** | 283.8 ms | **几乎不提速**（见下） |
+| 完整 unum_ops 库 | 73.7 ms | 3.9×，大头是 `spconv_devox_v4` 等 |
+
+> 只装这 4 个时 eager 几乎不提速：默认启发式会把大部分层排除在 `spconv_gather_gemm` 之外，
+> 而 eager 的时间大头在 devox / 邻域聚合的 torch 实现。这 4 个算子的价值在**图模式**——
+> 它们让 GE 动态图里 114 次 conv 全部落在同一融合核里，省掉每处约 5.7 ms 的 host 同步。
+>
+> 图模式下需放开阈值（否则大部分层仍回退）：
+> `export TS_SGG_MAX_K=100000 TS_SGG_MAX_COUT=512 TS_GE_COMPAT=1 UNUM_SD_NOSYNC=1`
+>
+> 想拿 eager 的 3.9× 需要完整算子库（`spconv_devox_v4`、`spconv_gather` 等），
+> 见 `unum_ops` 主库；换 torch 版本时 `.so` 需按对应 torch 重编（ABI 不匹配会回退，结果仍正确）。
 
 ## 5. 图模式（可选，需 torch ≥ 2.14）
 

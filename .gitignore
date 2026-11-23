@@ -10,3 +10,8 @@ aclnn_static_shape_kernel_outputs/
 fusion_result.json
 *.bak_*
 demo_spvcnn.pt
+
+# ---- AscendC 算子构建产物 ----
+csrc/ascend/*/build/
+csrc/ascend/*/op_extension/build/
+csrc/ascend/*/build_out/

@@ -1,0 +1,51 @@
+[
+    {
+        "op": "SpconvGatherGemm",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "feat",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float32"
+                ]
+            },
+            {
+                "name": "nb",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float32"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float32"
+                ]
+            }
+        ],
+        "attr": []
+    }
+]

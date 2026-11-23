@@ -472,7 +472,7 @@ def _rect_map_cap(in_coords, out_coords, ks, stride, dilation, n_in, n_out):
     sz = torch.stack([n_in.reshape(()).to(torch.int32), n_out.reshape(()).to(torch.int32)])
     rk, _unused, cn, mt = torch.ops.npu.spconv_keyprep_v3(
         in_coords.to(torch.int32).contiguous(), out_coords.to(torch.int32).contiguous(),
-        st, offs, 0, sz)
+        st, offs, _CAP_NBK, sz)
     start = (torch.cumsum(cn, 0) - cn).to(torch.int32)
     q = out_coords.to(torch.int32).contiguous()
     if hasattr(torch.ops.npu, "spconv_query_v2"):
@@ -482,7 +482,12 @@ def _rect_map_cap(in_coords, out_coords, ks, stride, dilation, n_in, n_out):
         nb = torch.ops.npu.spconv_query(q, rk, start, cn, mt)
     # nb 的值是**输入特征的行号**：补齐行不存在 → 丢弃为 -1（不能折回末行）
     lim = n_in.reshape(()).to(torch.int32)
-    return torch.where(nb >= lim, torch.full_like(nb, -1), nb)
+    nb = torch.where(nb >= lim, torch.full_like(nb, -1), nb)
+    # kernel 只写前 n_out 行，其余是 new_empty 的脏数据；必须显式置 -1，
+    # 否则下游 gather 会拿随机索引去读特征（越界 → 507035，且 eager/图不一致）。
+    _rows = torch.arange(nb.shape[0], device=nb.device)
+    _keep = (_rows < n_out.reshape(())).unsqueeze(1)
+    return torch.where(_keep, nb, torch.full_like(nb, -1))
 
 
 def _rect_map(in_coords, out_coords, ks, stride, dilation,
@@ -855,6 +860,14 @@ _CAP = int(os.environ.get("TS_CAP", "0") or 0)
 _SENTINEL = -1048576          # 哨兵坐标值：远离任何真实体素，且不会与真实键冲突
 
 
+# 显式固定 nbk（桶数）：kernel 默认按**真实** n 自动算，而 Meta 只能按 CAP 算，
+# 两者不一致会让 cumsum(cn) 在未初始化的桶上累加 → 图模式结果错。
+# 取 power-of-two ≥ 4*CAP，对任意 n ≤ CAP 都够用，且图形状静态。
+_CAP_NBK = 1
+while _CAP_NBK < 4 * max(_CAP, 1):
+    _CAP_NBK <<= 1
+
+
 def cap_enabled():
     return _CAP > 0
 
@@ -963,3 +976,14 @@ def _spdevoxelize_eager(feats, coords, weights):
         gathered = feats.index_select(0, idx.reshape(-1)[k0:k1].clamp(min=0))
         out.index_add_(0, rows[k0:k1], gathered * wflat[k0:k1].unsqueeze(-1))
     return out
+
+
+# 容量化 .so 必须在入图**之前**加载：在被 torch.compile trace 的区域里调用
+# torch.ops.load_library 会让 GE 报 "GRAPH internal error"。
+if _CAP > 0:
+    try:
+        for _op in ("keyprep_v3", "query_v2", "gather_gemm_v2"):
+            _load_cap_so(_op)
+        _load_cap_so("sortdedup_v4")
+    except Exception:
+        pass

@@ -88,11 +88,14 @@ def initial_voxelize(z, init_res, after_res):
         cap_coord, n_pts = spf.cap_pad_coords(new_int_coord)
         sparse_coord, u = unique_coords_cap(cap_coord, n_pts)
         sparse_coord = spf.cap_refill_sentinel(sparse_coord, u)
-        # 查询索引**用紧凑的唯一坐标**算：容量 buffer 的尾部是重复行，直接查会污染映射
-        # （实测返回全 0）。两者顺序一致（都由 sortdedup 产出、按 pack_keys 单调），
-        # 所以紧凑索引可直接用作 CAP 空间的索引（真实体素都在前 u 行）。
-        sparse_ref = unique_coords(new_int_coord)
-        idx_query = sphashquery(new_int_coord, sparse_ref).reshape(-1)
+        # 「点 → 体素行」完全在 device 上算：用容量版邻域表（ks=1）反查。
+        # 不能用 unique_coords(紧凑) + sphashquery —— 那条路上有 int(u) 的 host 读回
+        # （_fg.const），入图时会变成 Tensor.item() 的 graph break，等于把容量化的
+        # 目的又抵消了。
+        idx_query = spf._rect_map(
+            sparse_coord, new_int_coord, 1, (1, 1, 1), 1,
+            n_in=u, n_out=torch.tensor([new_int_coord.shape[0]], dtype=torch.int32,
+                                       device=new_int_coord.device)).reshape(-1)
         sparse_feat = _masked_mean(z.F, idx_query, sparse_coord.shape[0])
         new_tensor = SparseTensor(sparse_feat, sparse_coord, 1, n=u)
     else:

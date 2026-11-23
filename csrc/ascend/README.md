@@ -90,3 +90,32 @@ python demo.py --cr 0.5
 
 - `spconv_gather_gemm*` 要求 `cin % 8 == 0`（GE 路径用 `_pad_cin_to_8` 把 stem 的 4 通道补齐）。
 - 容量化版本的输出是**定长 CAP**：CAP 由调用方给定，超过 CAP 的帧需要更大 CAP（或分档）。
+
+## 7. 已知问题（容量化链路的验证进度）
+
+配方模块 `ascend_capacity.py` + 验证脚本 `test_capacity_chain.py`（仓库根）用于对拍
+「容量化路径 vs 固定行数路径」。当前结果：
+
+| 环节 | 状态 | 证据 |
+|---|---|---|
+| `spconv_sortdedup_v4` | ✅ 一致 | 真实 U 相同（895）；去重后的坐标集合逐位相同 |
+| `spconv_devox_v4` | ✅ 一致 | `max|d| = 0.000e+00`（对 torch 手算参考） |
+| `spconv_keyprep_v3` → `spconv_query_v2` | ❌ 未通 | `keyprep_v3` 的 `start`/`cnt` 输出**全 0** → `query_v2` 返回 nb 全 `-1`（固定版该输入非 -1 占比 57.6%） |
+
+已排除的原因：
+
+- **不是旧二进制**：用本目录源码重建这 5 个算子后重测，结果完全相同；
+- **不是 `sizes` 顺序**：`[n, m]` 与 `[m, n]` 都试过（后者仅 0.07% 非 -1）；
+- **不是 `nbk`**：`0` / `8192` / `32768` 都试过，均全 0。
+
+下一步（需要读 kernel 源码）：
+
+1. `op_kernel/spconv_key_prep_v3.cpp` 里确认 `start` 是否由 aclnn 真正写出。
+   当前 `op_extension/spconv_keyprep_v3_torch.cpp` 的注释写明 aclnn 输出顺序是
+   「`rkeys, cnt, meta, scratch`」，而 `start` 是另行 `at::empty({nbk})` 创建的
+   —— **怀疑 `start` 从未被 kernel 写入**（表现为全 0）。
+2. 若确实如此，两选一：把 `start` 加进 aclnn 输出列表，或在 Python 侧用
+   `torch.cumsum(cnt)` 自己算前缀和（后者不用改 kernel，代价是一次 device 端 scan）。
+3. 修好后 `test_capacity_chain.py` 的 [2] 段应转 PASS，随后再做模型级接线。
+
+在 [2] 转 PASS 之前，**不要把模型默认路径切到容量化算子**。

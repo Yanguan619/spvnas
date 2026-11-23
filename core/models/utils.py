@@ -37,7 +37,11 @@ def sphashquery(query, target, kernel_size=1):
     hashmap = torchsparse.backend.GPUHashTable(hashmap_keys, hashmap_vals)
     hashmap.insert_coords(torch.cat([target[:, 1:4], target[:, 0:1]], dim=1))
     kernel_size = make_ntuple(kernel_size, 3)
-    kernel_volume = int(np.prod(kernel_size))
+    # 纯 Python 乘积：np.prod 在 torch.compile 下会被 trace 成 aten.prod，
+    # 而 GE 没有它的转换器（NotImplementedError: ge_converter ... prod）
+    kernel_volume = 1
+    for _v in kernel_size:
+        kernel_volume *= int(_v)
     # 传 python int/tuple：原来先 make_tensor 到 device、再在 lookup_coords 里
     # .tolist() 回来，等于每层白送一次 H2D+D2H（也是入图的一个 graph break）。
     results = (

@@ -191,8 +191,26 @@ def get_conv_mode():
     return _CONV_MODE
 
 
-def spdownsample(coords, stride=2, kernel_size=2, dilation=1):
+def spdownsample(coords, stride=2, kernel_size=2, dilation=1, n=None):
+    """下采样 + 去重。
+
+    容量化模式（TS_CAP>0）：输入/输出都是 CAP 行，真实行数随返回值用 device 标量带出，
+    返回 `(coords_cap, n_new)`；否则保持原行为，只返回 coords。
+    """
     st = make_ntuple(stride, ndim=3)
+    if cap_enabled():
+        from ...backend import unique_coords_cap
+        if coords.shape[0] != _CAP:
+            raise RuntimeError("容量模式要求输入 coords 已是 %d 行（TS_CAP），实际 %d 行"
+                               % (_CAP, coords.shape[0]))
+        out = coords.clone()
+        for kk in range(3):
+            if st[kk] > 1:
+                out[:, 1 + kk] = torch.div(out[:, 1 + kk], st[kk], rounding_mode="floor")
+        if n is None:
+            n = torch.tensor([coords.shape[0]], dtype=torch.int32, device=coords.device)
+        out_cap, u = unique_coords_cap(out, n)
+        return cap_refill_sentinel(out_cap, u), u
     if all(s == 1 for s in st):
         return coords
     out = coords.clone()
@@ -691,6 +709,46 @@ _DEVOX = os.environ.get("TS_DEVOX", "1") != "0"
 # 原来默认 3 导致 _devox_op() 为 False → 全模式回退到 torch 的 GatherV2+IndexAdd，
 # 实测 aclgraph 20k cr0.5 从 47.3 降到 27.2 ms。缺 .so 时会自动回退，安全。
 _DEVOX_V = os.environ.get("TS_DEVOX_V", "4")
+
+# ---------------------------------------------------------------- 容量化路径（Stage A）
+# TS_CAP=<CAP>：coords 固定 CAP 行、真实行数放 device 标量 n（Python 侧不读回），
+# 图模式因此无需按形状冻结。默认 0 = 关闭（走原来的固定行数路径）。
+_CAP = int(os.environ.get("TS_CAP", "0") or 0)
+_SENTINEL = -1048576          # 哨兵坐标值：远离任何真实体素，且不会与真实键冲突
+
+
+def cap_enabled():
+    return _CAP > 0
+
+
+def cap_size():
+    return _CAP
+
+
+def cap_pad_coords(coords):
+    """把 coords 补齐到 CAP 行（尾部哨兵），返回 (coords_cap, n_dev)。
+
+    真实行数取 coords 现有行数 —— 只在**入口**调用一次（此时行数就是真实行数）。"""
+    dev = coords.device
+    k = coords.shape[0]
+    if k > _CAP:
+        raise RuntimeError("TS_CAP=%d < 实际行数 %d" % (_CAP, k))
+    n = torch.tensor([k], dtype=torch.int32, device=dev)
+    if k == _CAP:
+        return coords.contiguous(), n
+    sent = torch.full((_CAP - k, coords.shape[1]), _SENTINEL,
+                      dtype=coords.dtype, device=dev)
+    sent[:, 0] = 0
+    return torch.cat([coords, sent], 0).contiguous(), n
+
+
+def cap_refill_sentinel(coords_cap, u):
+    """dedup 之后：kernel 输出的尾部行是未定义的，必须重填成哨兵（device 侧，无同步）。"""
+    dev = coords_cap.device
+    keep = (torch.arange(_CAP, device=dev) < u.reshape(())).unsqueeze(1)
+    sent = torch.full_like(coords_cap, _SENTINEL)
+    sent[:, 0] = 0
+    return torch.where(keep, coords_cap, sent)
 _DEVOX_SO = {
     "1": (_OPS_ROOT + "/csrc/ascend/spconv_devox/op_extension/build/libspconv_devox_ops.so"),
     "2": (_OPS_ROOT + "/csrc/ascend/spconv_devox_v2/op_extension/build/libspconv_devox_v2_ops.so"),

@@ -25,6 +25,40 @@ _N_TABLES = 4
 
 
 
+# 容量化去重（TS_CAP 路径用）：输出固定 CAP 行，真实去重数在 device 的 u 里
+_SD4_SO = _OPS_ROOT + "/csrc/ascend/spconv_sortdedup_v4/op_extension/build/libspconv_sortdedup_v4_ops.so"
+_SD4_OK = None
+
+
+def _sd4_op():
+    global _SD4_OK
+    if _SD4_OK is None:
+        try:
+            torch.ops.load_library(_SD4_SO)
+            _SD4_OK = hasattr(torch.ops.npu, "spconv_sortdedup_v4")
+        except Exception:
+            _SD4_OK = False
+    return _SD4_OK
+
+
+def unique_coords_cap(coords_cap, n):
+    """容量化去重：coords_cap 已有 CAP 行（尾部是哨兵键），n 是真实行数(device int32[1])。
+
+    返回 (out_cap, u)：形如 (CAP,4) 与 int64[1]；**u 不要读回 host**，下游用
+    `arange(CAP) < u` 做掩码。注意 kernel 输出的尾部行是未定义的，调用方必须
+    在 dedup 之后重新把尾部填成哨兵（见 functional.spdownsample）。
+    """
+    if not _sd4_op():
+        raise RuntimeError("spconv_sortdedup_v4 not available (检查 UNUM_OPS_ROOT)")
+    if not torch.is_tensor(n):
+        n = torch.tensor([int(n)], dtype=torch.int32, device=coords_cap.device)
+    else:
+        n = n.to(dtype=torch.int32).reshape(1)
+    out, u = torch.ops.npu.spconv_sortdedup_v4(
+        coords_cap.to(torch.int32).contiguous(), n)
+    return out, u
+
+
 _DEDUP_SO = _OPS_ROOT + "/csrc/ascend/spconv_dedup_v2/op_extension/build/libspconv_dedup_v2_ops.so"
 _DEDUP_OK = None
 

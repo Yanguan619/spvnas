@@ -11,7 +11,11 @@ class SparseTensor:
     """feats: [N, C]; coords: [N, 4] int, columns are (batch, x, y, z) in
     level-0 voxel units; stride: spatial stride of this level."""
 
-    def __init__(self, feats, coords, stride=1, spatial_range=None, caches=None):
+    def __init__(self, feats, coords, stride=1, spatial_range=None, caches=None,
+                 n=None):
+        # n：容量化路径（TS_CAP>0）下「真实行数」的 device 标量 int32[1]；
+        #    None 表示固定行数模式（默认），此时 coords 行数就是真实行数。
+        self.n = n
         self.feats = _tensor(feats)
         self.coords = _tensor(coords)
         self.stride = (stride, stride, stride) if isinstance(stride, int) else tuple(stride)
@@ -71,11 +75,11 @@ class SparseTensor:
 
     def detach(self):
         return SparseTensor(self.feats.detach(), self.coords.detach(), self.stride,
-                            self.spatial_range, self._caches)
+                            self.spatial_range, self._caches, n=self.n)
 
     def clone(self):
         return SparseTensor(self.feats.clone(), self.coords.clone(), self.stride,
-                            self.spatial_range, self._caches)
+                            self.spatial_range, self._caches, n=self.n)
 
     def __len__(self):
         return self.coords.shape[0]
@@ -85,7 +89,7 @@ class SparseTensor:
                 or torch.equal(self.coords, other.coords)), \
             "SparseTensor add needs identical coord sets"
         return SparseTensor(self.feats + other.feats, self.coords, self.stride,
-                            self.spatial_range, self._caches)
+                            self.spatial_range, self._caches, n=self.n)
 
     def __repr__(self):
         return (f"SparseTensor(feats={tuple(self.feats.shape)}, "
@@ -106,4 +110,4 @@ def cat(tensors, dim=-1):
             "torchsparse.cat needs identical coords and stride"
     return SparseTensor(torch.cat([t.feats for t in tensors], dim=dim),
                         first.coords, first.stride, first.spatial_range,
-                        first._caches)
+                        first._caches, n=getattr(first, "n", None))

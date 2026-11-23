@@ -112,8 +112,19 @@ GM_MODE=ge GM_DYN=1 python demo.py --cr 0.5
 | GE 静态（分段） | **15.2** | 逐段 0 |
 | GE 动态（任意形状） | 36.8 | 5.96e-08 |
 
-> 图模式细节与坑位见我们另一份文档（`unum_ops` 仓库的 `ge.md` / `docs/spvnas/GRAPH_MODE_MATRIX.md`）。
-> 纯 torch 路径**不需要**这些环境变量。
+图模式细节与坑位见我们另一份文档（`unum_ops` 仓库的 `ge.md` / `docs/spvnas/GRAPH_MODE_MATRIX.md`）。
+纯 torch 路径**不需要**这些环境变量。
+
+最小可用写法（图模式**必须先 import `ascend_meta`**，否则 `torch.compile` 会报
+`Operator does not support running with fake tensors`）：
+
+```python
+import ascend_meta                      # 注册 4 个算子的 Meta（幂等）
+import torchair
+m = torch.compile(m, backend=torchair.get_npu_backend(), dynamic=True)   # GE 动态
+# m = torch.compile(m, backend=torchair.get_npu_backend(), dynamic=False) # GE 静态
+# aclgraph 用 torchair 的 npugraph_ex backend
+```
 
 ## 6. 目录说明
 

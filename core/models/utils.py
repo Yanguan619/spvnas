@@ -79,10 +79,16 @@ def _masked_mean(feats, idx, n_rows):
 
 
 def initial_voxelize(z, init_res, after_res):
-    new_float_coord = torch.cat(
-        [z.C[:, 0].view(-1, 1), (z.C[:, 1:] * init_res) / after_res], 1
-    )
-    # optimization TBD: init_res = after_res
+    if init_res == after_res:
+        # init_res == after_res 时 (c * init_res) / after_res 数学上是恒等，但 fp32 下
+        # 不等于 c（x*0.05/0.05 != x），紧接着的 floor 会把这点舍入噪声放大成“体素错一格”。
+        # 图模式（GE 静态）会对常系数做化简/重排，舍入方向因此与 eager 不同 —— 实测
+        # 3.6% 的点落到不同体素（argmax 96.35%）。这里直接跳过乘除，两条路径逐位一致。
+        new_float_coord = z.C.to(torch.float32)
+    else:
+        new_float_coord = torch.cat(
+            [z.C[:, 0].view(-1, 1), (z.C[:, 1:] * init_res) / after_res], 1
+        )
     new_int_coord = torch.floor(new_float_coord).int()
     if spf.cap_enabled():
         cap_coord, n_pts = spf.cap_pad_coords(new_int_coord)

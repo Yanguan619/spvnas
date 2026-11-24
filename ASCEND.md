@@ -279,3 +279,45 @@ gears[0] <= dim <= gears[-1]  and  (dim <= left) | (dim >= right)
 
 TODO（可选优化，不影响正确性）：把 CAP 改成从输入张量形状派生 + `set_dim_gears`，
 可把现在的「每档一张图（3 次编译）」变成「一张图覆盖多档（1 次编译）」。
+
+### 修复：GE 静态（dynamic=False）已可用 —— 2026-11-24
+
+**根因**：`initial_voxelize` 里这一行
+
+```python
+new_float_coord = torch.cat([z.C[:, 0].view(-1, 1), (z.C[:, 1:] * init_res) / after_res], 1)
+```
+
+`init_res == after_res`（都等于 voxel size 0.05）时，`(c * init_res) / after_res` 数学上是
+恒等，但 fp32 下 `x*0.05/0.05 != x`。紧接着的 `torch.floor(...)` 把这点舍入噪声放大成
+「体素错一格」。eager 与 GE 图对常系数的化简/重排不同（图里会做收缩、融合），舍入方向
+就不同 —— 实测 3.6% 的点落到不同体素（argmax 96.35%）。
+
+**修法**：`init_res == after_res` 时直接跳过乘除，用 `z.C.to(torch.float32)`：
+
+```python
+if init_res == after_res:
+    new_float_coord = z.C.to(torch.float32)
+else:
+    new_float_coord = torch.cat([z.C[:, 0].view(-1, 1), (z.C[:, 1:] * init_res) / after_res], 1)
+```
+
+**修后实测**（CAP 分档，每档一个编译好的图，精度均已对拍）：
+
+| 帧点数 | 档位 | GE 静态 | GE 动态 | 精度 (vs eager) |
+|---|---|---|---|---|
+| 6000  | 8192  | **22.61 ms** | 31.66 ms | 3.815e-06 |
+| 12000 | 16384 | **35.89 ms** | 38.80 ms | 4.768e-06 |
+| 20000 | 20480 | **49.88 ms** | 52.22 ms | 5.484e-06 |
+
+- 静态比动态快 1.05–1.40×；相对固定行数 eager（58.41 / 59.71 / 63.20）快 **1.27–2.58×**；
+- 编译：每档 35–72 s（一次性）。
+
+**排查方法（可复用）**：在模型内用 `torch._dynamo.disable` 逐个部件降级为 eager，
+其余照常入图，看 `max|d|` 何时从 8.06 掉回 1e-6。
+
+- `deconv` / `_masked_mean` / `conv apply` / `unique_coords_cap` / `_rect_map` /
+  `cap_refill` 单独降级**均无效**（结果严格相同）；
+- 降级**整个 `initial_voxelize`** → `3.576e-06`、argmax 100% ⇒ 问题在该函数体内的普通 torch 算子。
+
+即「逐个算子都正常，但组合进图后不一致」这种形态，优先怀疑**离散化前的浮点等价改写**。

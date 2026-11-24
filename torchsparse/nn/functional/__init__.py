@@ -418,7 +418,7 @@ def _fused_args(in_coords, out_coords, ks, stride, dilation):
 
     n = in_coords.shape[0]
     nbk = 1
-    while nbk < 4 * n:
+    while nbk < _NBK_MULT * n:
         nbk <<= 1
     nbk = min(nbk, 1 << 20)
     shift = max(0, (total - 1).bit_length() - (nbk.bit_length() - 1))
@@ -875,6 +875,9 @@ _DEVOX_V = os.environ.get("TS_DEVOX_V", "4")
 # TS_CAP=<CAP>：coords 固定 CAP 行、真实行数放 device 标量 n（Python 侧不读回），
 # 图模式因此无需按形状冻结。默认 0 = 关闭（走原来的固定行数路径）。
 _CAP = int(os.environ.get("TS_CAP", "0") or 0)
+# 桶数 = mult × 行数（2 的幂）。桶越多碰撞越少，但 Query 要扫整个桶数组，
+# 所以这是「内存扫描 vs 桶内二分」的折中；TS_NBK_MULT 可调（默认 4）。
+_NBK_MULT = max(1, int(os.environ.get("TS_NBK_MULT", "4") or 4))
 _SENTINEL = -1048576          # 哨兵坐标值：远离任何真实体素，且不会与真实键冲突
 
 
@@ -882,7 +885,7 @@ _SENTINEL = -1048576          # 哨兵坐标值：远离任何真实体素，且
 # 两者不一致会让 cumsum(cn) 在未初始化的桶上累加 → 图模式结果错。
 # 取 power-of-two ≥ 4*CAP，对任意 n ≤ CAP 都够用，且图形状静态。
 _CAP_NBK = 1
-while _CAP_NBK < 4 * max(_CAP, 1):
+while _CAP_NBK < _NBK_MULT * max(_CAP, 1):
     _CAP_NBK <<= 1
 
 # 容量档位（分档用）：默认 3 档。TS_CAP_BUCKETS="8192,16384,20480" 可覆盖。
@@ -911,7 +914,7 @@ def set_cap(cap):
         raise ValueError("set_cap 需要正数")
     _CAP = cap
     nbk = 1
-    while nbk < 4 * max(cap, 1):
+    while nbk < _NBK_MULT * max(cap, 1):
         nbk <<= 1
     _CAP_NBK = nbk
     return _CAP

@@ -349,3 +349,37 @@ else:
 2. **训练好的权重**：仓库只带 `demo_spvcnn.pt`（demo 权重）。官方 Model Zoo 的下载
    地址已失效（`hanlab.mit.edu/files/SPVNAS/...` 返回 404，项目页也已改版），
    需要另找可用镜像或自行训练。
+
+### 预训练权重（HF 镜像）与 mIoU 实测 —— 2026-11-24
+
+官方 Model Zoo 地址（`https://hanlab.mit.edu/files/SPVNAS/...`）已 404，可用替代：
+
+- 权重：`https://hf-mirror.com/torch-pointcloud/spvcnn-30gmacs.semantickitti.mit-han-lab`
+  （`model.safetensors` 21.8 MB；README 记 mIoU 60.7 / OA 91.94）。
+  直连 `huggingface.co` 在本机不通，**必须走 `hf-mirror.com`**。
+- 标签：`https://hf-mirror.com/datasets/WWZzz/SemanticKITTI/resolve/main/data_odometry_labels.zip`
+  （170 MB，含 00–10 全部标签，无需注册）。
+- 点云 08：`https://hf-mirror.com/datasets/larryshaw0079/SemanticKITTI-SP/resolve/main/08.tar.gz`
+  （7.13 GB）。官方全量 `data_odometry_velodyne.zip` 84.8 GB 虽支持 Range，但逐帧抽取实测
+  1.2 帧/分钟（≈56 小时），不可用。
+
+`convert_hf_spvcnn.py` 把 torch-pointcloud 命名映射成本仓 `SPVCNN` 的 state_dict：
+`317/317` 全部映射、逐键断言形状相等、`load_state_dict(strict=True)` 通过。
+规则要点：`stageN.M.net ↔ encoder.block{N-1}.blocks.M`、`stageN.0 ↔ ...downsample`、
+`upN.0 ↔ decoder.block{N-1}.upsample.conv`、`upN.1.0 ↔ ...upsample.residual`、
+`upN.1.1 ↔ decoder.block{N-1}.blocks.0`、`point_transforms ↔ fusion`、`classifier ↔ head`。
+
+实测（NPU，`evaluate_npu.py`，序列 08 前 30 帧，voxel=0.05，cr=0.5）：
+
+```
+[eval] 帧数=30
+mIoU = 57.77%        # README(全量 08) = 60.7
+```
+
+说明权重转换与评估流程都正确（错误的映射不可能到 58%）。全量 4071 帧待点云下完后补齐。
+
+`evaluate_npu.py` 的两处必要适配：
+1. 单卡 NPU：`.cuda() -> .npu()`，`MeanIoU` 的 `dist.allreduce` 打桩为恒等；
+2. **逐帧数据自己读**：vendored `SparseTensor` 构造时会对 coords 去重，导致原 dataset 返回的
+   `targets_mapped.F`（逐点标签）与 `.C` 行数不一致 → 直接按点取
+   `pred = outputs[inverse].argmax(1)`、`tgt = 每点标签`，与原脚本数学等价。

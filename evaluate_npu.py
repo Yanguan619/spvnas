@@ -1,31 +1,61 @@
-"""SemanticKITTI mIoU 评估（NPU 版，复用原仓库 evaluate.py 的流程与 core.callbacks.MeanIoU）。
+"""SemanticKITTI mIoU 评估（NPU，复用原 evaluate.py 的逐帧流程与 core.callbacks.MeanIoU）。
 
-与原 evaluate.py 的差异（只为能在单卡 NPU 上跑）：
-  1. 设备：.cuda() -> .npu()；不做 DistributedDataParallel，dist.allreduce 打桩为恒等；
-  2. 模型：直接用 builder.make_model() 的构造参数（SPVCNN(cr, pres, vres)），
-     不经 model_zoo（官方下载地址 https://hanlab.mit.edu/files/SPVNAS/... 已 404）；
-  3. checkpoint：--ckpt 显式给；
-  4. 数据集：--root 指向 sequences 目录（其下 08/velodyne/*.bin），split 'test' 即 val(08)。
+与原 evaluate.py 的差异（只为能在单卡 NPU 上跑通）：
+  1. 设备：.cuda() -> .npu()；MeanIoU 里的 dist.allreduce 打桩为恒等（单卡）；
+  2. 模型：直接 SPVCNN(num_classes, cr, pres, vres)，不走 model_zoo（官方权重地址已 404）；
+  3. 逐帧数据自己读：原 dataset 把 inverse_map / 逐点标签包进 SparseTensor，而 vendored
+     SparseTensor 会对 coords 去重，导致 .F 与 .C 行数不一致；这里直接按点取，语义与
+     原脚本一致（pred = outputs[voxel_of_point][inverse].argmax(1)，tgt = 每点标签）。
 
-逐帧流程与原脚本一致：outputs -> inverse_map 映射 -> argmax -> MeanIoU。
+用法：
+  python evaluate_npu.py --root <sequences> --ckpt <ckpt> --cr 0.5 --voxel 0.05 [--limit N]
 """
 import argparse
+import pathlib
 import sys
 
 import numpy as np
 import torch
-import torch.utils.data
 
 from torchsparse import SparseTensor
+from torchsparse.utils.quantize import sparse_quantize
 from core.datasets.semantic_kitti import SemanticKITTIInternal
 from core.models.semantic_kitti.spvcnn import SPVCNN
 import core.callbacks as callbacks_mod
 from core.callbacks import MeanIoU
 
 
+def iter_frames(root, seq='08', voxel=0.05, limit=0, label_map=None):
+    vdir = pathlib.Path(root) / seq / 'velodyne'
+    ldir = pathlib.Path(root) / seq / 'labels'
+    files = sorted(vdir.glob('*.bin'))
+    if limit:
+        files = files[:limit]
+    for f in files:
+        pts = np.fromfile(f, dtype=np.float32)
+        if pts.size % 4:
+            continue
+        pts = pts.reshape(-1, 4)
+        lf = ldir / (f.stem + '.label')
+        if lf.exists():
+            raw = np.fromfile(lf, dtype=np.int32).reshape(-1)
+        else:
+            raw = np.zeros(pts.shape[0], dtype=np.int32)
+        labels_pt = label_map[raw & 0xFFFF].astype(np.int64)
+
+        pc_ = np.round(pts[:, :3] / voxel).astype(np.int32)
+        pc_ -= pc_.min(0, keepdims=1)
+        uniq, inds, inv = sparse_quantize(pc_, return_index=True, return_inverse=True)
+        yield dict(feat=pts[inds].astype(np.float32),
+                   pc=uniq.astype(np.int32),
+                   labels_pt=labels_pt,
+                   inverse=inv.astype(np.int64))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--root', required=True, help='sequences 目录（其下 08/velodyne/*.bin）')
+    ap.add_argument('--seq', default='08')
     ap.add_argument('--ckpt', default=None)
     ap.add_argument('--cr', type=float, default=0.5)
     ap.add_argument('--voxel', type=float, default=0.05)
@@ -43,17 +73,9 @@ def main():
     # 单卡：把 MeanIoU 里的 dist.allreduce 打成恒等（原脚本依赖 torchpack 分布式）
     callbacks_mod.dist = type('D', (), {'allreduce': staticmethod(lambda v, reduction=None: v)})()
 
-    # 直接构造 val 分片（= 序列 08）。原仓库的 SemanticKITTI 包装类会同时构造 train
-    # 分片（需要 00-07/09/10 全部序列），评估时不需要。
-    split = SemanticKITTIInternal(args.root, args.voxel, args.num_points, split='val')
-    files = split.files
-    if args.limit:
-        split.files = files[:args.limit]
-    print('[env] frames=%d  root=%s  cr=%.2f  voxel=%.2f  device=%s'
-          % (len(split.files), args.root, args.cr, args.voxel, dev), flush=True)
-
-    loader = torch.utils.data.DataLoader(split, batch_size=1, num_workers=0,
-                                         collate_fn=split.collate_fn)
+    # 复用数据集类只为拿 label_map（19 类映射表）
+    ds = SemanticKITTIInternal(args.root, args.voxel, args.num_points, split='val')
+    lm = ds.label_map
 
     model = SPVCNN(num_classes=args.num_classes, cr=args.cr,
                    pres=args.voxel, vres=args.voxel).eval()
@@ -63,8 +85,8 @@ def main():
             sd = sd['state_dict']
         sd = {k.replace('module.', '').replace('model.', ''): v for k, v in sd.items()}
         missing, unexpected = model.load_state_dict(sd, strict=False)
-        print('[ckpt] loaded %s  missing=%d unexpected=%d'
-              % (args.ckpt, len(missing), len(unexpected)), flush=True)
+        print('[ckpt] %s  missing=%d unexpected=%d' % (args.ckpt, len(missing), len(unexpected)),
+              flush=True)
     if args.fold_bn:
         from torchsparse.nn import fold_bn
         fold_bn(model)
@@ -73,28 +95,24 @@ def main():
     iou = MeanIoU(args.num_classes, args.ignore_label)
     iou._before_epoch()
 
+    n = 0
     with torch.no_grad():
-        for i, feed_dict in enumerate(loader):
-            inputs = feed_dict['lidar'].to(dev)
-            outputs = model(inputs)
-            invs = feed_dict['inverse_map']
-            all_labels = feed_dict['targets_mapped']
+        for fr in iter_frames(args.root, args.seq, args.voxel, args.limit, lm):
+            feat = torch.from_numpy(fr['feat']).to(dev)
+            pc = torch.from_numpy(fr['pc']).to(dev)
+            batch = torch.zeros(pc.shape[0], 1, dtype=pc.dtype, device=dev)
+            x = SparseTensor(feat, torch.cat([batch, pc], 1), 1)
+            outputs = model(x)
 
-            _outs, _tgts = [], []
-            for idx in range(int(invs.C[:, 0].max()) + 1):
-                cur_scene_pts = (inputs.C[:, 0] == idx).cpu().numpy()
-                cur_inv = invs.F[invs.C[:, 0] == idx].cpu().numpy()
-                cur_label = (all_labels.C[:, 0] == idx).cpu().numpy()
-                outputs_mapped = outputs[cur_scene_pts][cur_inv].argmax(1)
-                targets_mapped = all_labels.F[cur_label]
-                _outs.append(outputs_mapped)
-                _tgts.append(targets_mapped)
-            out = torch.cat(_outs, 0).cpu()
-            tgt = torch.cat(_tgts, 0).cpu()
-            iou._after_step({'outputs': out, 'targets': tgt})
-            if (i + 1) % 50 == 0:
-                print('  ... %d 帧' % (i + 1), flush=True)
+            inv = torch.from_numpy(fr['inverse']).long().to(dev)
+            pred = outputs[inv].argmax(1).cpu()
+            tgt = torch.from_numpy(fr['labels_pt']).long()
+            iou._after_step({'outputs': pred, 'targets': tgt})
+            n += 1
+            if n % 50 == 0:
+                print('  ... %d 帧' % n, flush=True)
 
+    print('[eval] 帧数=%d' % n, flush=True)
     iou._after_epoch()
     print('### EVAL_NPU_DONE')
 

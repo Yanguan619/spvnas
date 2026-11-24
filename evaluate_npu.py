@@ -67,11 +67,15 @@ def main():
     ap.add_argument('--voxel', type=float, default=0.05)
     ap.add_argument('--num-points', type=int, default=180000)
     ap.add_argument('--num-classes', type=int, default=19)
-    ap.add_argument('--ignore-label', type=int, default=0)
+    ap.add_argument('--ignore-label', type=int, default=255,
+                    help='忽略类；本仓 label_map 把未标注映射为 255（见 configs）')
     ap.add_argument('--limit', type=int, default=0, help='只评估前 N 帧（0=全部）')
     ap.add_argument('--offset', type=int, default=0, help='从第 offset 帧开始')
     ap.add_argument('--device', default='npu:0')
     ap.add_argument('--fold-bn', action='store_true')
+    ap.add_argument('--class-perm', default=None,
+                    help='把模型输出通道映射到本仓类别顺序，如 5,7,8,...')
+    ap.add_argument('--stats-jsonl', default=None, help='逐帧混淆统计落盘（可崩溃后聚合）')
     args = ap.parse_args()
 
     dev = torch.device(args.device)
@@ -99,6 +103,11 @@ def main():
         fold_bn(model)
     model = model.to(dev)
 
+    perm = None
+    if args.class_perm:
+        perm = torch.tensor([int(x) for x in args.class_perm.split(',')], dtype=torch.long,
+                            device=dev)
+
     iou = MeanIoU(args.num_classes, args.ignore_label)
     iou._before_epoch()
 
@@ -116,9 +125,25 @@ def main():
             outputs = model(x)
 
             inv = torch.from_numpy(fr['inverse']).long().to(dev)
-            pred = outputs[inv].argmax(1).cpu()
+            pred = outputs[inv].argmax(1)
+            if perm is not None:
+                pred = perm[pred]
+            pred = pred.cpu()
             tgt = torch.from_numpy(fr['labels_pt']).long()
             iou._after_step({'outputs': pred, 'targets': tgt})
+            if args.stats_jsonl:
+                import json as _json
+                m = (tgt != args.ignore_label)
+                tt = tgt[m].numpy(); pp = pred[m].numpy()
+                C = args.num_classes
+                seen = np.bincount(tt, minlength=C)
+                corr = np.bincount(tt[pp == tt], minlength=C)
+                pos = np.bincount(pp, minlength=C)
+                with open(args.stats_jsonl, 'a') as fh:
+                    fh.write(_json.dumps({'i': args.offset + n,
+                                          'seen': seen.tolist(),
+                                          'correct': corr.tolist(),
+                                          'positive': pos.tolist()}) + '\n')
             n += 1
             if n % 50 == 0:
                 print('  ... %d 帧' % n, flush=True)

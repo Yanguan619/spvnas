@@ -396,3 +396,31 @@ else:
 2. **逐帧数据自己读**：vendored `SparseTensor` 构造时会对 coords 去重，导致原 dataset 返回的
    `targets_mapped.F`（逐点标签）与 `.C` 行数不一致 → 直接按点取
    `pred = outputs[inverse].argmax(1)`、`tgt = 每点标签`，与原脚本数学等价。
+
+### mIoU 对齐完成（2026-11-24）
+
+**踩过的坑（决定成败的一处）**：`--ignore-label` 必须是 **255**，不是 0。
+
+本仓 `label_map` 把未标注类映射为 **255**（`configs/semantic_kitti/default.yaml: ignore_label: 255`），
+而 **0 是 `road`**。用 0 当忽略类会：把占比最大的 road 整类剔除、未标注点反而计入统计 ——
+表现为 class 0 的 `seen=0`、稀有类 IoU 全面偏低（mIoU 51.5% 而非 60%）。修正后 OA 立刻回到 91.9%。
+
+另：不要给模型输出做「类别置换」。HF 权重名里的 `mit-han-lab` 说明它是本仓同源的模型，
+通道顺序**与本仓一致**；torch-pointcloud 的 `SEMANTIC_KITTI_CLASSES` 是它自己训练用的顺序，
+套上来会让 OA 从 91.6% 掉到 0.96%。该选项（`--class-perm`）默认关闭。
+
+**最终结果**（序列 08，3446/4071 帧 = 84.6% 覆盖；voxel=0.05，cr=0.5，HF 转换权重）：
+
+| 指标 | 本仓 NPU | README 全量 08 | 差 |
+|---|---|---|---|
+| **mIoU** | **60.00%** | 60.7 | **0.70** |
+| **OA** | **91.89%** | 91.94 | **0.05** |
+
+剩余 625 帧因设备侧偶发 507035 被跳过（分块跑 + 逐帧统计落盘，崩溃不丢已算帧）。
+结论：**权重转换、评估流程、数值都与参考实现对齐**。
+
+复跑：
+```bash
+python evaluate_npu.py --root <sequences> --ckpt spvcnn30_mit.pt \
+  --cr 0.5 --voxel 0.05 --ignore-label 255 [--stats-jsonl x.jsonl] [--limit N --offset M]
+```

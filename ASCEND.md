@@ -247,3 +247,35 @@ F.set_cap(F.cap_for(n_pts))      # 选最小能装下的档位（默认 8192/163
 - 下一步可查：在静态图下逐个算子做 golden（`sortdedup_v4`、`keyprep_v3+query_v2`、
   `gather_gemm_v2` 的 [0,n) 写 + 尾部置零、`_nbT` 逆表、`_masked_mean`），
   找出在整图静态融合下行为不同的那一个。
+
+### 决策：保留容量 buffer（不转泛化动态）—— 2026-11-24
+
+实测 `TS_CAP` 不设 + `dynamic=True` + 无档位（纯泛化动态）：
+
+- 5 处 graph break，GE 最终报 `Verifying NetOutput failed`，出不了图。
+
+逐项定位结论：
+
+1. `SpconvQuery` 的 InferShape 读了不存在的输入 index 5（真实 bug，已修，
+   见 `dc967ee`）——但它只是第一层；
+2. 结构性阻塞是**数据相关的输出形状**：
+   - `torch_scatter.scatter_mean` 的输出行数 = `max(idx)+1`；
+   - `backend` 的 `out[:int(u)]`（去重后行数）、`_finish` 的 `int(h[4])`。
+   这些值既不是输入维度的函数，也不能写成 `-1`（GE 的形状推断必须能静态推出），
+   于是子图输出维只能是 `-1` → `NetOutput` 校验失败。
+
+`torchair.inference.set_dim_gears`（已确认存在于本机 torchair）**不能**替代上界：
+它的 guard 是精确枚举——
+
+```python
+gears[0] <= dim <= gears[-1]  and  (dim <= left) | (dim >= right)
+```
+
+即 `dim` 必须正好等于某个档位值，落在两档之间直接失败；`gears[-1]` 就是上界。
+
+所以：**在这代 CANN 9.2 + torchair 上，「不预分配上界」与「一次编译走到底」对这套
+稀疏算法是互斥的**。保留容量 buffer（`TS_CAP` + device 标量 `n`），并可选 CAP 分档
+以压低 padding 成本。
+
+TODO（可选优化，不影响正确性）：把 CAP 改成从输入张量形状派生 + `set_dim_gears`，
+可把现在的「每档一张图（3 次编译）」变成「一张图覆盖多档（1 次编译）」。

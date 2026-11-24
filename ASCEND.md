@@ -1,5 +1,9 @@
 # SPVNAS / SPVCNN on Ascend NPU
 
+
+> 📄 **交付主文档见 [ASCEND_ADAPTATION.md](ASCEND_ADAPTATION.md)**（结构化的适配文档：环境、架构、容量化设计、性能、精度、缺陷清单、已知限制）。
+> 本文是**按时间追加的实测记录与排错流水**，作为证据保留。
+
 本分支（`ascend`）提供 **Ascend NPU 上的稀疏卷积后端 `torchsparse`（纯 PyTorch 实现）**，
 让上游 SPVNAS/SPVCNN 代码可以在 **不编译任何 CUDA 扩展**、**不安装任何私有算子库** 的前提下跑起来。
 

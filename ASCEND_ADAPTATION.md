@@ -187,7 +187,49 @@ README 的表格只有 MACs 与 mIoU、没有延迟。为了可比，这里在**
 | 整帧（~95k 体素） | **固定行数 eager（+ TQ=2）** | **97.99 ms** |
 | 需要一张图覆盖多种点数 | 容量化 + GE 动态（单档） | 52.39 ms @20k |
 
-### 5.5 复跑
+### 5.5 整帧算子级画像（eager，94625 体素）
+
+`msprof --application` 采集整帧 eager（`prof_full.py` + `analyze_op_profile.py`），
+6293 个算子实例 / 36 种类型：
+
+| 算子 | 次/帧 | ms/帧 | 占比 |
+|---|---:|---:|---:|
+| `SpconvGatherGemm` | 38 | 19.9 | 26.8% |
+| `SpconvQuery` | 15 | 19.2 | 25.9% |
+| `SpconvSortDedupV3` | 5 | 8.7 | 11.8% |
+| `SpconvKeyprepV2` | 15 | 8.6 | 11.6% |
+| `SpconvDevoxV4` | 4 | 4.3 | 5.8% |
+| `SpconvKeyprepV2Prefix` | 15 | 3.1 | 4.2% |
+| `Slice` | 222 | 2.2 | 3.0% |
+| 其余（layout/逐元素/BN 等） | ~1000 | ~7.8 | ~11% |
+| **设备侧 kernel 合计** | | **≈74 ms** | |
+
+关键读数：**设备侧 kernel 合计约 74 ms，而 wall 是 102.58 ms** —— 约 **28% 是 host 间隙**，
+这正是图模式理论上应该吃掉的收益；但整帧下图模式反而慢（见 5.4），说明它在这套
+数据规模下把 kernel 端拖慢了，抵消并超过了调度收益。
+
+### 5.6 为什么整帧图模式反而慢（已定位到"规模相关"，未到 kernel 级）
+
+**已知事实**
+1. 20k 体素：容量 eager 70.5 → GE 静态 49.9 ms（图模式**快 20 ms**）；
+2. 94625 体素：容量 eager 143.7 → GE 静态 176.6 ms（图模式**慢 33 ms**）——
+   **交叉点存在，且与规模相关**；
+3. 占比最高的两类算子（`SpconvQuery` 25.9% + `SortDedup` 11.8%）都是**搜索/排序**类，
+   对行数敏感；eager 下可用 host 侧真实行数 `n` 提前剪枝/分块，图内只能按 **CAP 全量**执行。
+
+**尚未拿到的证据（工具限制，如实记录）**
+- `torch_npu.profiler` + GE：trace 时报 `spconv_keyprep_v3` 的 `nbk` 是 Python int，
+  而 GE 自动转换器要求它是张量 → 编译失败。根因是仓库**没有注册自定义 GE converter**，
+  全靠 torchair 自动生成；
+- `msprof --application` + GE：`op_summary` 只有 12 行（整图记成 `ModelExecute`），
+  `--ge-api=l1` 也未产出节点级表 → **当前 CANN/torchair 组合下无 GE node-level profile**。
+
+**下一步三个可选项**（按预期收益）
+1. 把 `nbk` 改成张量并注册自定义 converter → 图模式可 profile，且可能减少 padding 计算；
+2. 直接优化 `SpconvQuery`（占 19.2 ms）：它在 eager 下已是第二大户；
+3. 维持现状：整帧走 eager（95–102 ms，比 1080Ti 快 1.6×），图模式只用于 ≤20k 小帧。
+
+### 5.7 复跑
 
 ```bash
 TS_CAP=20480 python3 perf_cap.py                       # 容量 eager / 单档动态

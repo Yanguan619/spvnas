@@ -69,7 +69,7 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* qs = context->GetInputShape(0);
-    const gert::Shape* ms = context->GetInputShape(5);
+    const gert::Shape* ms = context->GetInputShape(4);   // meta is input index 4 (op has 5 inputs)
     if (qs == nullptr || ms == nullptr) {
         return ge::GRAPH_FAILED;
     }

@@ -424,3 +424,27 @@ else:
 python evaluate_npu.py --root <sequences> --ckpt spvcnn30_mit.pt \
   --cr 0.5 --voxel 0.05 --ignore-label 255 [--stats-jsonl x.jsonl] [--limit N --offset M]
 ```
+
+### mIoU 完整评测（4071/4071 帧 = 100%，2026-11-24）
+
+| 指标 | 本仓 NPU（全量序列 08） | README 全量 08 | 差 |
+|---|---|---|---|
+| **mIoU** | **60.63%** | 60.7 | **0.07** |
+| **OA** | **91.91%** | 91.94 | **0.03** |
+
+这就是完整评测：SemanticKITTI 08 全部 **4071 帧**，`voxel=0.05`、`cr=0.5`、
+HF 转换权重（`spvcnn30_mit.pt`），`ignore_label=255`，逐点重映射后聚合全局混淆矩阵。
+
+**稳定性处理**：设备侧偶发 `507035 vector core exception` 会中断进程，因此评测按
+「分块（250 帧/进程）+ 逐帧统计落盘（`--stats-jsonl`）+ 缺失帧二分重试」跑：
+
+1. 第一轮分块跑完 3446/4071 帧；
+2. `fill_missing.py` 把缺失区间按 20 帧一块重跑，块内再失败就二分到单帧；
+3. 最终 4071/4071 = 100%，`frame_stats2/stats.jsonl` 按帧号去重后聚合。
+
+结论：**权重转换（317/317）、类别顺序（无需置换）、评估协议（ignore_label=255）
+全部与参考实现对齐**，mIoU 与 OA 都落在 0.1 个点以内。
+
+注：逐类 IoU 的**类名**需要仓库自带的 `semantic-kitti.yaml` 才能准确标注
+（`label_map` 的索引并非 `kept_labels` 的排列顺序）；mIoU/OA 是置换不变量，
+不受影响。

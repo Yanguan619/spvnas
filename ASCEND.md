@@ -321,3 +321,31 @@ else:
 - 降级**整个 `initial_voxelize`** → `3.576e-06`、argmax 100% ⇒ 问题在该函数体内的普通 torch 算子。
 
 即「逐个算子都正常，但组合进图后不一致」这种形态，优先怀疑**离散化前的浮点等价改写**。
+
+## SemanticKITTI mIoU 评估（NPU，复用原仓库流程）
+
+`evaluate_npu.py` 沿用原 `evaluate.py` 的逐帧流程（`outputs -> inverse_map 重映射
+-> argmax`）与仓库自带的 `core.callbacks.MeanIoU`，只做了单卡 NPU 适配：
+
+- `.cuda()` -> `.npu()`；`MeanIoU` 里的 `dist.allreduce` 打桩为恒等（单卡）；
+- 模型直接用 `SPVCNN(num_classes, cr, pres, vres)` 构造（不走 `model_zoo`，
+  因为官方权重地址 `https://hanlab.mit.edu/files/SPVNAS/...` 已 404）；
+- `--ckpt` 显式给权重；`--root` 指向 `sequences` 目录（其下 `08/velodyne/*.bin`）；
+- 直接构造 `SemanticKITTIInternal(split='val')`（= 序列 08），不构造 train 分片。
+
+### 已验证（链路冒烟，非数据集精度）
+
+```
+[env] frames=1  root=.../sequences  cr=0.50  device=npu:0
+[ckpt] loaded demo_spvcnn.pt  missing=0 unexpected=0
+逐类 IoU 打印 + mIoU = 0.8354（1 帧 + demo 权重，数值无意义，仅证明链路通）
+```
+
+### 跑真 mIoU 还缺两样
+
+1. **数据集**：SemanticKITTI 序列 08（`sequences/08/velodyne/*.bin` + `labels/*.label`）。
+   本机 `/dataset` 不存在；`/data2` 余量 2.0 TB 够放。拿到后：
+   `python evaluate_npu.py --root <...>/sequences --ckpt <ckpt> --cr 0.5`
+2. **训练好的权重**：仓库只带 `demo_spvcnn.pt`（demo 权重）。官方 Model Zoo 的下载
+   地址已失效（`hanlab.mit.edu/files/SPVNAS/...` 返回 404，项目页也已改版），
+   需要另找可用镜像或自行训练。

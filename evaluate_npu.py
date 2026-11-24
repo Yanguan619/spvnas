@@ -25,10 +25,12 @@ import core.callbacks as callbacks_mod
 from core.callbacks import MeanIoU
 
 
-def iter_frames(root, seq='08', voxel=0.05, limit=0, label_map=None):
+def iter_frames(root, seq='08', voxel=0.05, limit=0, label_map=None, offset=0):
     vdir = pathlib.Path(root) / seq / 'velodyne'
     ldir = pathlib.Path(root) / seq / 'labels'
     files = sorted(vdir.glob('*.bin'))
+    if offset:
+        files = files[offset:]
     if limit:
         files = files[:limit]
     for f in files:
@@ -41,6 +43,10 @@ def iter_frames(root, seq='08', voxel=0.05, limit=0, label_map=None):
             raw = np.fromfile(lf, dtype=np.int32).reshape(-1)
         else:
             raw = np.zeros(pts.shape[0], dtype=np.int32)
+        if raw.size != pts.shape[0]:
+            # 半截下载：.bin 与 .label 点数不一致，跳过（并计入统计）
+            yield dict(bad=True)
+            continue
         labels_pt = label_map[raw & 0xFFFF].astype(np.int64)
 
         pc_ = np.round(pts[:, :3] / voxel).astype(np.int32)
@@ -63,6 +69,7 @@ def main():
     ap.add_argument('--num-classes', type=int, default=19)
     ap.add_argument('--ignore-label', type=int, default=0)
     ap.add_argument('--limit', type=int, default=0, help='只评估前 N 帧（0=全部）')
+    ap.add_argument('--offset', type=int, default=0, help='从第 offset 帧开始')
     ap.add_argument('--device', default='npu:0')
     ap.add_argument('--fold-bn', action='store_true')
     args = ap.parse_args()
@@ -97,7 +104,11 @@ def main():
 
     n = 0
     with torch.no_grad():
-        for fr in iter_frames(args.root, args.seq, args.voxel, args.limit, lm):
+        skipped = 0
+        for fr in iter_frames(args.root, args.seq, args.voxel, args.limit, lm, args.offset):
+            if fr.get('bad'):
+                skipped += 1
+                continue
             feat = torch.from_numpy(fr['feat']).to(dev)
             pc = torch.from_numpy(fr['pc']).to(dev)
             batch = torch.zeros(pc.shape[0], 1, dtype=pc.dtype, device=dev)
@@ -112,8 +123,12 @@ def main():
             if n % 50 == 0:
                 print('  ... %d 帧' % n, flush=True)
 
-    print('[eval] 帧数=%d' % n, flush=True)
+    print('[eval] 可用帧数=%d  跳过(半截/损坏)=%d' % (n, skipped), flush=True)
     iou._after_epoch()
+    seen = float(iou.total_seen.sum())
+    corr = float(iou.total_correct.sum())
+    if seen > 0:
+        print('[OA] %.4f%%   (total_seen=%.0f)' % (100.0 * corr / seen, seen), flush=True)
     print('### EVAL_NPU_DONE')
 
 

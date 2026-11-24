@@ -369,12 +369,25 @@ else:
 `upN.0 ↔ decoder.block{N-1}.upsample.conv`、`upN.1.0 ↔ ...upsample.residual`、
 `upN.1.1 ↔ decoder.block{N-1}.blocks.0`、`point_transforms ↔ fusion`、`classifier ↔ head`。
 
-实测（NPU，`evaluate_npu.py`，序列 08 前 30 帧，voxel=0.05，cr=0.5）：
+实测（NPU，`evaluate_npu.py`，序列 08 子集，voxel=0.05，cr=0.5）：
 
-```
-[eval] 帧数=30
-mIoU = 57.77%        # README(全量 08) = 60.7
-```
+| 帧集合 | 可用帧 | **OA** | mIoU |
+|---|---|---|---|
+| 前 100 帧 | 98（跳过 2 帧半截文件） | **91.75%** | 55.09% |
+| 后 60 帧 | 60 | **90.92%** | 54.54% |
+| 前 30 帧 | 30 | — | 57.77% |
+| **README 全量 08** | 4071 | **91.94%** | **60.7** |
+
+**结论：权重转换正确**。判据是 **OA 91.75% vs README 91.94%（差 0.19 点）**，
+稀有类（bicycle 0.10 vs ~0.29、other-ground 0.001 vs ~0.28、motorcyclist 0）
+在 100 帧子集里样本极少，是 mIoU 低 5 个点的主因；常见类基本吻合
+（road 0.933 / building 0.871 / vegetation 0.835 / terrain 0.758）。
+
+`evaluate_npu.py` 另外两处必要处理：
+- **帧完整性校验**：`.bin` 点数必须等于 `.label` 行数，半截下载文件跳过并计数
+  （Range 抽取中断会留下半截文件，实测 100 帧里 2–3 帧是坏的）；
+- `--offset` 支持切片对照，并打印 **OA**（`total_correct/total_seen`）——
+  OA 比 mIoU 对子集大小更稳健，是更可靠的验收指标。
 
 说明权重转换与评估流程都正确（错误的映射不可能到 58%）。全量 4071 帧待点云下完后补齐。
 

@@ -5,6 +5,7 @@ import torchsparse.nn.functional as spf
 from torchsparse import SparseTensor
 from torchsparse.nn.functional.devoxelize import calc_ti_weights
 from torchsparse.nn.utils import *
+from torchsparse.backend import unique_coords, unique_coords_cap
 from torchsparse.utils import *
 from torchsparse.utils.tensor_cache import TensorCache
 import torch_scatter
@@ -34,14 +35,19 @@ def sphashquery(query, target, kernel_size=1):
         2 * target.shape[0], dtype=torch.int32, device=target.device
     )
     hashmap = torchsparse.backend.GPUHashTable(hashmap_keys, hashmap_vals)
-    hashmap.insert_coords(target[:, [1, 2, 3, 0]])
+    hashmap.insert_coords(torch.cat([target[:, 1:4], target[:, 0:1]], dim=1))
     kernel_size = make_ntuple(kernel_size, 3)
-    kernel_volume = np.prod(kernel_size)
-    kernel_size = make_tensor(kernel_size, device=target.device, dtype=torch.int32)
-    stride = make_tensor((1, 1, 1), device=target.device, dtype=torch.int32)
+    # 纯 Python 乘积：np.prod 在 torch.compile 下会被 trace 成 aten.prod，
+    # 而 GE 没有它的转换器（NotImplementedError: ge_converter ... prod）
+    kernel_volume = 1
+    for _v in kernel_size:
+        kernel_volume *= int(_v)
+    # 传 python int/tuple：原来先 make_tensor 到 device、再在 lookup_coords 里
+    # .tolist() 回来，等于每层白送一次 H2D+D2H（也是入图的一个 graph break）。
     results = (
         hashmap.lookup_coords(
-            query[:, [1, 2, 3, 0]], kernel_size, stride, kernel_volume
+            torch.cat([query[:, 1:4], query[:, 0:1]], dim=1),
+            kernel_size, (1, 1, 1), kernel_volume
         )
         - 1
     )[: query.shape[0]]
@@ -50,17 +56,59 @@ def sphashquery(query, target, kernel_size=1):
 
 # z: PointTensor
 # return: SparseTensor
-def initial_voxelize(z, init_res, after_res):
-    new_float_coord = torch.cat(
-        [z.C[:, 0].view(-1, 1), (z.C[:, 1:] * init_res) / after_res], 1
-    )
-    # optimization TBD: init_res = after_res
-    new_int_coord = torch.floor(new_float_coord).int()
-    sparse_coord = torch.unique(new_int_coord, dim=0)
-    idx_query = sphashquery(new_int_coord, sparse_coord).reshape(-1)
+def _cap_fix_index(idx, n):
+    """容量模式：把落在补齐区的索引映射回行 0（尾部是行 0 坐标的重复）。"""
+    if n is None or not spf.cap_enabled():
+        return idx
+    lim = n.reshape(()).to(idx.dtype)
+    return torch.where(idx >= lim, (lim - 1).to(idx.dtype), idx)
 
-    sparse_feat = torch_scatter.scatter_mean(z.F, idx_query.long(), dim=0)
-    new_tensor = SparseTensor(sparse_feat, sparse_coord, 1)
+
+def _masked_mean(feats, idx, n_rows):
+    """按 idx 做「加权和 / 有效计数」的均值，输出恒为 n_rows 行（补齐行得 0）。
+
+    不用 scatter_mean：它按 max(idx)+1 推输出行数，容量模式下会短于 CAP。
+    """
+    dev, dt = feats.device, feats.dtype
+    sums = torch.zeros((n_rows, feats.shape[1]), dtype=dt, device=dev)
+    sums.index_add_(0, idx.long(), feats)
+    ones = torch.ones(feats.shape[0], dtype=dt, device=dev)
+    cnts = torch.zeros(n_rows, dtype=dt, device=dev)
+    cnts.index_add_(0, idx.long(), ones)
+    return sums / cnts.clamp(min=1).unsqueeze(1)
+
+
+def initial_voxelize(z, init_res, after_res):
+    if init_res == after_res:
+        # init_res == after_res 时 (c * init_res) / after_res 数学上是恒等，但 fp32 下
+        # 不等于 c（x*0.05/0.05 != x），紧接着的 floor 会把这点舍入噪声放大成“体素错一格”。
+        # 图模式（GE 静态）会对常系数做化简/重排，舍入方向因此与 eager 不同 —— 实测
+        # 3.6% 的点落到不同体素（argmax 96.35%）。这里直接跳过乘除，两条路径逐位一致。
+        new_float_coord = z.C.to(torch.float32)
+    else:
+        new_float_coord = torch.cat(
+            [z.C[:, 0].view(-1, 1), (z.C[:, 1:] * init_res) / after_res], 1
+        )
+    new_int_coord = torch.floor(new_float_coord).int()
+    if spf.cap_enabled():
+        cap_coord, n_pts = spf.cap_pad_coords(new_int_coord)
+        sparse_coord, u = unique_coords_cap(cap_coord, n_pts)
+        sparse_coord = spf.cap_refill_sentinel(sparse_coord, u)
+        # 「点 → 体素行」完全在 device 上算：用容量版邻域表（ks=1）反查。
+        # 不能用 unique_coords(紧凑) + sphashquery —— 那条路上有 int(u) 的 host 读回
+        # （_fg.const），入图时会变成 Tensor.item() 的 graph break，等于把容量化的
+        # 目的又抵消了。
+        idx_query = spf._rect_map(
+            sparse_coord, new_int_coord, 1, (1, 1, 1), 1,
+            n_in=u, n_out=torch.tensor([new_int_coord.shape[0]], dtype=torch.int32,
+                                       device=new_int_coord.device)).reshape(-1)
+        sparse_feat = _masked_mean(z.F, idx_query, sparse_coord.shape[0])
+        new_tensor = SparseTensor(sparse_feat, sparse_coord, 1, n=u)
+    else:
+        sparse_coord = unique_coords(new_int_coord)
+        idx_query = sphashquery(new_int_coord, sparse_coord).reshape(-1)
+        sparse_feat = torch_scatter.scatter_mean(z.F, idx_query.long(), dim=0)
+        new_tensor = SparseTensor(sparse_feat, sparse_coord, 1)
     z._caches.idx_query[z.s] = idx_query
     z.C = new_float_coord
     return new_tensor
@@ -68,6 +116,17 @@ def initial_voxelize(z, init_res, after_res):
 
 # x: SparseTensor, z: PointTensor
 # return: SparseTensor
+def _lvl_n(x):
+    """取某层的真实行数：优先 x.n，退回 caches.nmaps[stride]（容量模式）。"""
+    n = getattr(x, "n", None)
+    if n is None:
+        try:
+            n = x._caches.nmaps.get(tuple(x.s))
+        except Exception:
+            n = None
+    return n
+
+
 def point_to_voxel(x, z):
     if z._caches.idx_query.get(x.s) is None:
         # Note: x.C has a smaller range after downsampling.
@@ -78,12 +137,26 @@ def point_to_voxel(x, z):
             ],
             1,
         )
-        idx_query = sphashquery(new_int_coord, x.C)
+        if spf.cap_enabled() and _lvl_n(x) is not None:
+            # device-only：容量版邻域表（ks=1），避免 sphashquery -> _query_args 里
+            # int(h[4]) 的 host 读回（入图是 Tensor.item() graph break）
+            _np = torch.tensor([new_int_coord.shape[0]], dtype=torch.int32,
+                               device=new_int_coord.device)
+            idx_query = spf._rect_map(x.C, new_int_coord, 1, (1, 1, 1), 1,
+                                      n_in=_lvl_n(x), n_out=_np).transpose(0, 1).contiguous()
+        else:
+            idx_query = sphashquery(new_int_coord, x.C)
         z._caches.idx_query[x.s] = idx_query
     else:
         idx_query = z._caches.idx_query[x.s]
     # Haotian: This impl. is not elegant
     idx_query = idx_query.clamp_(0)
+    if spf.cap_enabled() and _lvl_n(x) is not None:
+        idx_query = _cap_fix_index(idx_query, _lvl_n(x))
+        sparse_feat = _masked_mean(z.F, idx_query.reshape(-1), x.C.shape[0])
+        new_tensor = SparseTensor(sparse_feat, x.C, x.s, n=_lvl_n(x))
+        new_tensor._caches = x._caches
+        return new_tensor
     sparse_feat = torch_scatter.scatter_mean(z.F, idx_query.long(), dim=0)
     new_tensor = SparseTensor(sparse_feat, x.C, x.s)
     new_tensor._caches = x._caches
@@ -103,7 +176,13 @@ def voxel_to_point(x, z, nearest=False):
             1,
         )
         point_coords_int = torch.floor(point_coords_float).int()
-        idx_query = sphashquery(point_coords_int, x.C, kernel_size=2)
+        if spf.cap_enabled() and _lvl_n(x) is not None:
+            _np = torch.tensor([point_coords_int.shape[0]], dtype=torch.int32,
+                               device=point_coords_int.device)
+            idx_query = spf._rect_map(x.C, point_coords_int, 2, (1, 1, 1), 1,
+                                      n_in=_lvl_n(x), n_out=_np).transpose(0, 1).contiguous()
+        else:
+            idx_query = sphashquery(point_coords_int, x.C, kernel_size=2)
         weights = calc_ti_weights(point_coords_float[:, 1:], idx_query, scale=1)
 
         if nearest:

@@ -2,3 +2,16 @@
 .torch/
 */__pycache__/
 *.pyc
+
+# ---- Ascend / 实验产物 ----
+kernel_meta/
+export_only_prof_dir/
+aclnn_static_shape_kernel_outputs/
+fusion_result.json
+*.bak_*
+demo_spvcnn.pt
+
+# ---- AscendC 算子构建产物 ----
+csrc/ascend/*/build/
+csrc/ascend/*/op_extension/build/
+csrc/ascend/*/build_out/

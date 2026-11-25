@@ -236,6 +236,37 @@ for tile in tiles(TB=128~256 输出行):
 | P3 | 接入 `conv3d`（保持 API 不变），整帧复测 | 整帧 ≤ 85 ms |
 | P4 | 4071 帧 mIoU 回归 + 图模式回归 | mIoU 60.63±0.1、图模式无退化 |
 
+## 3.5 P1/P2 实现清单（按顺序，每步可独立验证）
+
+新建 `csrc/ascend/spconv_gather_gemm_c/`（**不动 v2**，零回归风险），从 v2 复制
+`msopgen.json / CMakeLists.txt / CMakePresets.json / build.sh / op_host /
+op_kernel / op_extension` 后按下列顺序改：
+
+| # | 改动 | 验证方式 | 通过标准 |
+|---|---|---|---|
+| 1 | 改名：`SpconvGatherGemmV2`→`...C`，`spconv_gather_gemm_v2`→`..._c`；tiling 结构体加 `ck`（每 tap 有效行数，device 张量） | `build.sh` 编译通过、`load_library` 后可调用 | 能跑通空实现不崩 |
+| 2 | AIV：把「按输出行 gather」改成「按 tap 全局 gather」：读 `nb[:,k]`，压缩出 `rows_k[]`、`src_k[]`（可用已有 `spconv_query` 或 AIV 内 scan） | 只跑 AIV（`Process` 里 `if ASCEND_IS_AIC return;`），对比 dump 的 staging 与 Python 参考 | 与参考逐字节一致 |
+| 3 | AIC：每 tap 一次 GEMM `(c_k × cin) @ (cin × cout)` 写 scratch；按 chunk 切（`c_k` 可达 1.1 万行） | 单 tap 结果与 `feat[src_k] @ w[k]` 对比 | `max|d| ≤ 1e-5` |
+| 4 | AIV：把 scratch 累加进 `out[rows_k]`（顺序累加，无需原子，因为按行唯一） | 全 27 tap 后与 v2 kernel 对比 | `max|d| ≤ 1e-5` |
+| 5 | cross-core 同步：AIV 写完一个 chunk 的 staging 才 set flag；AIC 算完才置位让 AIV 累加。**参考 v2 的 flag 语义**（V→C 一个 id = 两个 AIV 到齐算一次；C→V 每 AIV 独立 id） | 长跑 1000 次不死锁 | 无 hang |
+| 6 | 接入 `conv3d`：`TS_GG_C=1` 时走新算子，默认仍走 v2 | 单帧输出与 v2 一致 | `max|d| ≤ 1e-5` |
+| 7 | 全量回归 | `evaluate_npu.py` 4071 帧 | mIoU 60.63±0.1 / OA 91.91±0.1 |
+| 8 | 图模式回归 | `TS_CAP=98304` + `torch.compile(dynamic=False)` | 编译成功、结果一致 |
+
+**性能检查点**：第 4 步跑通后，单 conv 应看到 `1173 → ≤500 µs`；第 7 步后整帧应
+`101.45 → ≤92 ms`。若第 4 步没到 500 µs，先看是不是 `c_k` 的 GEMM M 太小
+（可把同 tap 的多个 chunk 合并成一个 GEMM，或跨 tile 增加 M）。
+
+### 已知会踩的坑
+
+- **权重**：27 × `cin × cout` fp32 = 27×48×48×4 = **249 KB**，UB 只有 192 KB →
+  权重必须走 L1 或每 tap 流式 `SetTensorB`（每 tap 一次，27 次开销可接受）；
+- **`ck` 是 device 张量**：图模式下不能回 host 读，tiling 只能用 CAP 上界 →
+  要么按 CAP 分配 scratch，要么给 `c_k` 单独准备静态上界；
+- **GM scratch**：`out[M,cout]` 是输出，中间 GEMM 结果建议放 workspace，
+  每 chunk 一小块，避免再引入 490 MB 级流量；
+- **累加顺序**：按 tap 顺序累加改变浮点求和顺序 → `max|d|` 会到 1e-6 量级，属正常。
+
 ## 4. 风险与已知坑
 
 1. **窗口外 fallback 会破坏「只读一次」的假设** —— 必须保证 fallback 分支正确且不拖慢主路径；

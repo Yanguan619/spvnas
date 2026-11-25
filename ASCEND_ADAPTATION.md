@@ -497,6 +497,45 @@ SemanticKITTI **序列 08 全部 4071 帧**，`voxel=0.05`、`cr=0.5`、HF 转�
 
 图模式数值等价（同帧对拍 eager）：`4.768e-06 / 5.007e-06 / 3.815e-06`，argmax 100%。
 
+### 6.1b 评测数据是什么场景（实测构成）
+
+**数据集**：SemanticKITTI 单帧语义分割 benchmark。官方 **test split（序列 11–21）标签不公开**，
+所以评测用 **序列 08**（官方 **validation** split）。
+
+**场景**：德国卡尔斯鲁厄市区/城郊街道（KITTI odometry seq08 同一条路线），
+车载 Velodyne HDL-64E（64 线、360°）以 10 Hz 行驶，共 **4,071 帧 ≈ 407 s ≈ 4 km**。
+
+**每帧规模**（实测 4,071 帧）：中位 **123,638 点**（92,476 – 128,443），合计 499.1 M 点，
+其中有效标注 **476.8 M（95.5%）**、未标注 2.5%。
+
+**类别构成**（实测，19 类；占比 = 该类点数 / 标注点总数）
+
+| 类 | 占比 | 类 | 占比 |
+|---|---:|---|---:|
+| **vegetation** | **30.61%** | trunk | 1.15% |
+| **road** | **18.45%** | parking | 1.25% |
+| **building** | **13.45%** | other-vehicle | 0.47% |
+| **sidewalk** | **12.64%** | pole | 0.47% |
+| **terrain** | **11.93%** | truck | 0.11% |
+| **car** | **6.47%** | other-ground | 0.10% |
+| fence | 2.65% | person | 0.10% |
+| motorcycle | 0.07% | bicyclist | 0.06% |
+| bicycle | 0.05% | traffic-sign | 0.05% |
+| motorcyclist | 0.00% | | |
+
+**读法**：典型的城市/城郊街道——植被、道路、建筑、人行道、地形五类占 **87%**；
+动态目标（车 6.5% + 其他车/人/两轮 ~0.8%）约 7%；**稀有类（motorcyclist / bicyclist /
+traffic-sign / bicycle）合计 < 0.2%**。这就是为什么 mIoU 对稀有类极敏感、子集评测会波动
+（前 100 帧 55–69% 都可能），而 OA 始终稳定在 91–92%。
+
+> 顺带解决了此前"逐类 IoU 类名待定"的问题：模型输出的 19 类**按 torch-pointcloud 的
+> `SEMANTIC_KITTI_CLASSES` 顺序**（**0=car**，1=bicycle，2=motorcycle，3=truck，
+> 4=other-vehicle，5=person，6=bicyclist，7=motorcyclist，**8=road**，9=parking，
+> 10=sidewalk，11=other-ground，12=building，13=fence，**14=vegetation**，15=trunk，
+> 16=terrain，17=pole，18=traffic-sign），**不是**本仓 `kept_labels` 的顺序。
+> 判据：idx 0 占 6.47%（= car）、idx 14 占 30.6%（= vegetation，城郊树木密集），
+> 与官方 seq08 分布一致。
+
 ### 6.2 权重与数据来源（官方地址已失效，改用 HF 镜像）
 
 | 内容 | 链接 |

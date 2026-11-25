@@ -304,6 +304,44 @@ rk, start, cn, mt = torch.ops.npu.spconv_keyprep_v3(...)   # 原来是 rk, _unus
 **结论修正**：整帧口径下 **aclgraph 才是最快的（75.0 ms，cr=0.5）**，GE 静态/动态分别比
 eager 慢 6%/10%；此前"图模式整帧慢 20–25%"的结论是把未固化路径的数字当成了图模式本身。
 
+### 5.4d step 级分解：为什么 aclgraph 能消掉 host 间隙，GE 不能
+
+用 `torch_npu.profiler` API 采到 **step 级** `step_trace_time.csv`（eager，94,625 体素，
+wait1/warmup2/active3，Step 3/4/5）：
+
+| Step | Computing（设备） | **Free（host 空闲）** | Step 总计 | Bubble |
+|---|---:|---:|---:|---:|
+| 3 | 73,701 µs | 34,131 µs | 107.83 ms | 0 |
+| 4 | 73,647 µs | 36,271 µs | 109.92 ms | 0 |
+| 5 | 73,759 µs | 34,153 µs | 107.91 ms | 0 |
+
+**eager 的 34 ms Free = host 间隙**，Bubble=0 说明设备侧没有气泡，慢全在前端。
+
+拿三种模式的总时间去减 eager 的设备时间（73.70 ms）：
+
+| 配置 | 总时间 | 减 eager 设备时间 | 解读 |
+|---|---:|---:|---|
+| eager | 107.83 | +34.13 | **= step_trace 里的 Free，完全对上** |
+| **aclgraph** | **75.15** | **+1.45** | **Free 被吃掉 96%** |
+| GE 静态 | 106.46 | +32.76 | ≈ eager 的 Free（差 1.4 ms） |
+| GE 动态 | 109.61 | +35.91 | 同上 |
+
+**结论**：GE 模式的 kernel 时间与 eager 基本相同，那 ~33 ms 是**同一份 host 开销没被消掉**；
+只有 aclgraph 把它压到 1.4 ms。机制差异：
+
+| | aclgraph（npugraph_ex） | GE（torchair） |
+|---|---|---|
+| 机制 | **capture→replay**：把 eager 跑过的 kernel 序列原样录成 ACL graph，replay 一次 API 调用 | FX 图翻译成 **AscendIR 图**，由 GE 调度 |
+| 每次调用的 host 工作 | 构建输入 + 一次 `rtGraphLaunch` ≈ **1.4 ms** | torchair wrapper：dynamo guard、输入装配、`SparseTensor` 构造、`_fg` 常量查找、输出解包 ≈ **33 ms** |
+| 每帧变化的 device 张量 | capture 期按地址固定，host 不参与 | 算子带 `n`/`sizes` 这类每帧变化的 device 输入，每次执行都要准备 |
+
+**所以「图模式消不掉 Free」不成立**：aclgraph 消得掉，GE 消不掉 —— 差别在「消的是 kernel
+提交」还是「消的是算子间调度」。
+
+> 采集方式提醒：step 记录只在**进程内**用 `torch_npu.profiler` + `prof.step()` 才会产生；
+> 用外部 `msprof --application=...` 采是拿不到 step 边界的（`step_trace` 为 0 行）。
+> 本地留存的原始数据：`E:\Projects\dl\profiling_step\`（带 step）与 `profiling_eager2\`（无 step）。
+
 ### 5.5 整帧算子级画像（eager，94625 体素）
 
 `msprof --application` 采集整帧 eager（`prof_full.py` + `analyze_op_profile.py`），

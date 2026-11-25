@@ -187,6 +187,35 @@ README 的表格只有 MACs 与 mIoU、没有延迟。为了可比，这里在**
 | 整帧（~95k 体素） | **固定行数 eager（+ TQ=2）** | **97.99 ms** |
 | 需要一张图覆盖多种点数 | 容量化 + GE 动态（单档） | 52.39 ms @20k |
 
+### 5.4b 修掉一处 25.6 ms/帧的纯浪费（`torch.cumsum` 重复计算前缀和）
+
+对容量路径做算子级 profile 时发现：**`Cumsum` 是最大单项，25.6 ms/帧**（524288 元素 × 15 次）。
+
+根因：`spconv_keyprep_v3` 的 C++ wrapper **已经**用专用算子 `aclnnSpconvKeyprepV3Prefix`
+算好了独占前缀和，并作为 `output[1]` 返回（`return {rkeys, start, cnt, meta}`），
+但 Python 侧把它当占位 `_unused` 丢掉，又用 `torch.cumsum(cn, 0) - cn` 重算了一遍。
+
+修复：直接用 `output[1]`：
+
+```python
+rk, start, cn, mt = torch.ops.npu.spconv_keyprep_v3(...)   # 原来是 rk, _unused, cn, mt
+```
+
+**效果（整帧 94625 体素）**
+
+| 配置 | 修前 | 修后 | 变化 |
+|---|---|---|---|
+| 容量 eager CAP=98304 | 143.47 ms | **116.77 ms** | −18.6% |
+| 容量 + GE 静态 CAP=98304 | 176.55 ms | **150.64 ms** | −14.7% |
+| 容量 + GE 动态 CAP=131072 | 202.81 ms | **178.70 ms** | −11.9% |
+| 固定行数 eager | 101.45 ms | 101.45 ms | 不受影响 |
+
+**正确性**：CAP == M（与固定路径同输入）时 nb 逐项比对 **100.0000%（2554875/2554875）一致**；
+容量路径端到端 mIoU 65.74% / OA 91.41%（29 帧）与固定路径 65.87% / 91.44%（30 帧）一致。
+
+> 教训：profile 里出现「一个跟算法无关的算子排第一」时，先查是不是重复计算 ——
+> 这次是同一份前缀和被算了两次，第二次用的还是慢得多的通用 `cumsum`。
+
 ### 5.5 整帧算子级画像（eager，94625 体素）
 
 `msprof --application` 采集整帧 eager（`prof_full.py` + `analyze_op_profile.py`），

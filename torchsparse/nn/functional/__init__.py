@@ -470,10 +470,10 @@ def _rect_map_cap(in_coords, out_coords, ks, stride, dilation, n_in, n_out):
                               device=in_coords.device).to(torch.int32)
     st = _const_tensor(tuple(int(v) for v in stride), torch.int32, in_coords.device)
     sz = torch.stack([n_in.reshape(()).to(torch.int32), n_out.reshape(()).to(torch.int32)])
-    rk, _unused, cn, mt = torch.ops.npu.spconv_keyprep_v3(
+    rk, start, cn, mt = torch.ops.npu.spconv_keyprep_v3(
         in_coords.to(torch.int32).contiguous(), out_coords.to(torch.int32).contiguous(),
         st, offs, _CAP_NBK, sz)
-    start = (torch.cumsum(cn, 0) - cn).to(torch.int32)
+    start = start.to(torch.int32)
     q = out_coords.to(torch.int32).contiguous()
     if hasattr(torch.ops.npu, "spconv_query_v2"):
         nb = torch.ops.npu.spconv_query_v2(q, rk, start, cn, mt,

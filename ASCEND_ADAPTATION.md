@@ -641,9 +641,15 @@ python fill_missing.py        # 补齐缺失帧
    - 关闭 `TS_GATHER` / `TS_FUSED` / `TS_DECONV_INV` **对无算子路径毫无影响**（仍是 30.20%），
      说明不是开关误开，而是纯 torch 实现本身算错；
    - 反过来，**有算子但关掉 gather** 时 OA 42.61% → gather 算子是最主要的正确贡献者。
-   - **未修复**（需要逐算子对拍才能定位到具体 gather/邻域构建实现）；
-   已用 `npu_patches.install(require_ops=True)`（三个交付脚本默认开启）把静默错结果变成
-   明确报错，避免使用者拿到 30% 的假精度。
+   - **已建立真值基准**（`test_conv3d_repro.py`，1200 体素 / 8 通道 / 3×3×3 固定权重）：
+     kernel 索引约定为 **x-major**：`k = ((x+1)*3 + (y+1))*3 + (z+1)`；
+     **算子路径与真值吻合到 3e-07（1200/1200 行全对）**，**纯 torch 路径与 4 种约定
+     全不匹配**（最好 2.40，1200/1200 行全错）→ 是纯 torch 的 conv3d 实现本身算错，
+     不是索引约定差异。
+   - **未定位到具体行**：`_kernel_map` 返回的是打包后的元组结构，逐 offset 拆解比对成本较高，
+     留待后续。已确认范围：`_lookup_offsets` / `_apply_forward_eager` 二者之一。
+   - 已用 `npu_patches.install(require_ops=True)`（三个交付脚本默认开启）把静默错结果变成
+     明确报错，避免使用者拿到 30% 的假精度。
 
 
 1. **CAP 是上限**：`N > CAP` 需要更大的 CAP（重编一张图）。分档即为此；

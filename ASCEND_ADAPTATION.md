@@ -646,8 +646,13 @@ python fill_missing.py        # 补齐缺失帧
      **算子路径与真值吻合到 3e-07（1200/1200 行全对）**，**纯 torch 路径与 4 种约定
      全不匹配**（最好 2.40，1200/1200 行全错）→ 是纯 torch 的 conv3d 实现本身算错，
      不是索引约定差异。
-   - **未定位到具体行**：`_kernel_map` 返回的是打包后的元组结构，逐 offset 拆解比对成本较高，
-     留待后续。已确认范围：`_lookup_offsets` / `_apply_forward_eager` 二者之一。
+   - **邻域表已排除**：直接对拍 `_lookup_offsets` 的产出（1200×27），
+     **算子路径与纯 torch 路径 100% 一致**（32400 格 0 差异）→ 表不是缺陷源。
+   - **缺陷在多处**：`有算子 + TS_GATHER=0`（同样走 `_kernel_map` + `_apply_forward_eager`）
+     OA 42.61%，而纯 torch 只有 30.20% —— 两条路走同一段卷积代码却差 12 个百分点，
+     说明纯 torch 路径上**除卷积应用之外的算子（devox / downsample / sortdedup）也有错**。
+   - **未定位到具体行**：卷积应用侧（`_apply_forward_eager`）与 devox/downsample 侧都还需
+     各自对拍，留待后续。
    - 已用 `npu_patches.install(require_ops=True)`（三个交付脚本默认开启）把静默错结果变成
      明确报错，避免使用者拿到 30% 的假精度。
 

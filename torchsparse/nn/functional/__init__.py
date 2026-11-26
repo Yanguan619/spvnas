@@ -67,11 +67,7 @@ _FUSED_OK = None
 def _fused_op():
     global _FUSED_OK
     if _FUSED_OK is None:
-        try:
-            torch.ops.load_library(_FUSED_SO)
-            _FUSED_OK = hasattr(torch.ops.npu, "spconv_fused")
-        except Exception:
-            _FUSED_OK = False
+        _FUSED_OK = _load_cap_so("fused")
     return _FUSED_OK
 if _GRAPH and _DYNAMIC:
     # ACL graph fixes tensor addresses, but this op's output shape (M, K*cin)
@@ -87,40 +83,54 @@ _SGG = os.environ.get("TS_SGG", "1") != "0"
 _SGG_OK = None
 
 
-def _load_cap_so(op):
-    """按需加载容量化算子的 .so（幂等）。返回该算子是否可用。
+def _op_so_candidates(name):
+    """算子 .so 的候选路径，按优先级：
 
-    容量路径不能依赖调用方事先 import 过别的模块 —— 之前正是因为没人加载
-    keyprep_v3/query_v2，`hasattr` 判断失败后静默退回 torch 表（把补齐行也建进表），
-    导致重复键返回补齐区索引。
+    1. pip 安装后产物随包分发在 ``core/ops/``（`pip install -e .` 自动编译并放入）；
+    2. 源码树内 ``<repo>/csrc/ascend/<name>/op_extension/build/``（直接在仓库里跑）；
+    3. ``UNUM_OPS_ROOT`` / ``SPVNAS_OPS_ROOT`` 指向的外部构建树。
+    """
+    import pathlib as _p
+
+    out = []
+    try:
+        import core.ops as _pkg_ops                       # pip 安装布局
+        out.append(str(_p.Path(_pkg_ops.OPS_DIR) / ("lib%s_ops.so" % name)))
+    except Exception:
+        pass
+    try:                                                  # 源码树布局
+        repo = _p.Path(__file__).resolve().parents[3]
+        out.append(str(repo / "csrc" / "ascend" / name /
+                       "op_extension" / "build" / ("lib%s_ops.so" % name)))
+    except Exception:
+        pass
+    for env in ("SPVNAS_OPS_ROOT", "UNUM_OPS_ROOT"):
+        root = (os.environ.get(env) or "").rstrip("/")
+        if root:
+            out.append(root + "/csrc/ascend/%s/op_extension/build/lib%s_ops.so" % (name, name))
+            out.append(root + "/%s/op_extension/build/lib%s_ops.so" % (name, name))
+    return out
+
+
+def _load_cap_so(op):
+    """按需加载算子 .so（幂等）。返回该算子是否可用。
+
+    依次尝试 :func:`_op_so_candidates` 给出的路径 —— pip 安装（产物在 core/ops）、
+    源码树、外部构建树都覆盖，因此**不需要**用户设置任何环境变量。
     """
     name = "spconv_" + op
     if hasattr(torch.ops.npu, name):
         return True
-    so = _OPS_ROOT + "/csrc/ascend/%s/op_extension/build/lib%s_ops.so" % (name, name)
-    try:
-        torch.ops.load_library(so)
-    except Exception:
-        return False
-    return hasattr(torch.ops.npu, name)
-
-
-def _load_cap_so(op):
-    """按需加载容量化算子的 .so（幂等）。返回该算子是否可用。
-
-    容量路径不能依赖调用方事先 import 过别的模块 —— 之前正是因为没人加载
-    keyprep_v3/query_v2，`hasattr` 判断失败后静默退回 torch 表（把补齐行也建进表），
-    导致重复键返回补齐区索引。
-    """
-    name = "spconv_" + op
-    if hasattr(torch.ops.npu, name):
-        return True
-    so = _OPS_ROOT + "/csrc/ascend/%s/op_extension/build/lib%s_ops.so" % (name, name)
-    try:
-        torch.ops.load_library(so)
-    except Exception:
-        return False
-    return hasattr(torch.ops.npu, name)
+    for so in _op_so_candidates(name):
+        if not os.path.exists(so):
+            continue
+        try:
+            torch.ops.load_library(so)
+        except Exception:
+            continue
+        if hasattr(torch.ops.npu, name):
+            return True
+    return False
 
 
 _SGG2_SO = _OPS_ROOT + "/csrc/ascend/spconv_gather_gemm_v2/op_extension/build/libspconv_gather_gemm_v2_ops.so"
@@ -137,11 +147,7 @@ def _sgg_v2_op():
 def _sgg_op():
     global _SGG_OK
     if _SGG_OK is None:
-        try:
-            torch.ops.load_library(_SGG_SO)
-            _SGG_OK = hasattr(torch.ops.npu, "spconv_gather_gemm")
-        except Exception:
-            _SGG_OK = False
+        _SGG_OK = _load_cap_so("gather_gemm")
     return _SGG_OK
 
 
@@ -164,11 +170,7 @@ def _gather_op():
     """(M,K) int32 nb -> dense [M, K*cin] float32, or None if unavailable."""
     global _GATHER_OK
     if _GATHER_OK is None:
-        try:
-            torch.ops.load_library(_GATHER_SO)
-            _GATHER_OK = hasattr(torch.ops.npu, "spconv_gather")
-        except Exception:
-            _GATHER_OK = False
+        _GATHER_OK = _load_cap_so("gather")
     return _GATHER_OK
 
 

@@ -75,7 +75,6 @@ include_directories(
 )
 set(SOURCES
     spconv_keyprep_v2_torch.cpp
-    register.cpp
 )
 add_library(spconv_keyprep_v2_ops SHARED ${SOURCES})
 target_compile_definitions(spconv_keyprep_v2_ops PRIVATE

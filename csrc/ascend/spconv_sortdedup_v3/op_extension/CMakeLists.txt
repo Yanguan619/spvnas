@@ -75,7 +75,6 @@ include_directories(
 )
 set(SOURCES
     spconv_sortdedup_v3_torch.cpp
-    register.cpp
 )
 add_library(spconv_sortdedup_v3_ops SHARED ${SOURCES})
 target_compile_definitions(spconv_sortdedup_v3_ops PRIVATE

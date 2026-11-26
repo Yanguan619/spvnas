@@ -75,7 +75,6 @@ include_directories(
 )
 set(SOURCES
     spconv_gather_gemm_torch.cpp
-    register.cpp
 )
 add_library(spconv_gather_gemm_ops SHARED ${SOURCES})
 target_compile_definitions(spconv_gather_gemm_ops PRIVATE

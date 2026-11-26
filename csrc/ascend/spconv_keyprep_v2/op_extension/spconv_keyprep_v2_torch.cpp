@@ -23,7 +23,6 @@
 #include <torch/extension.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
-#include "spconv_keyprep_v2_ops.h"
 
 #ifndef UNUM_VENDOR_DIR
 #define UNUM_VENDOR_DIR "spconv_keyprep_v2"
@@ -222,3 +221,17 @@ std::vector<at::Tensor> spconv_keyprep_v2(const at::Tensor& in_coords, const at:
     return {rkeys, start, cnt, meta, u};
 }
 }  // namespace ascend_kernel
+
+
+// ---- torch 算子注册（原 register.cpp，合并以减少文件数）----
+TORCH_LIBRARY_FRAGMENT(npu, m) {
+    m.def("spconv_keyprep_v2(Tensor in_coords, Tensor out_coords, Tensor stride, Tensor offs, "
+          "int nbk) -> Tensor[]");
+}
+
+TORCH_LIBRARY_IMPL(npu, PrivateUse1, m) {
+    m.impl("spconv_keyprep_v2", [](const at::Tensor& in_coords, const at::Tensor& out_coords,
+                                   const at::Tensor& stride, const at::Tensor& offs, int64_t nbk) {
+        return ascend_kernel::spconv_keyprep_v2(in_coords, out_coords, stride, offs, nbk);
+    });
+}

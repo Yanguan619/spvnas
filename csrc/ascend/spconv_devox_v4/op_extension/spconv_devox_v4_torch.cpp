@@ -5,7 +5,6 @@
 #include <torch/extension.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
-#include "spconv_devox_v4_ops.h"
 
 #ifndef UNUM_VENDOR_DIR
 #define UNUM_VENDOR_DIR "spconv_devox"
@@ -137,3 +136,17 @@ at::Tensor spconv_devox(const at::Tensor& feat, const at::Tensor& idx,
 }
 
 }  // namespace ascend_kernel
+
+
+// ---- torch 算子注册（原 register.cpp，合并以减少文件数）----
+TORCH_LIBRARY_FRAGMENT(npu, m) {
+    m.def("spconv_devox_v4(Tensor feat, Tensor idx, Tensor w, Tensor coords, Tensor n) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(npu, PrivateUse1, m) {
+    m.impl("spconv_devox_v4", [](const at::Tensor& feat, const at::Tensor& idx,
+                              const at::Tensor& w, const at::Tensor& coords,
+                              const at::Tensor& n) {
+        return ascend_kernel::spconv_devox(feat, idx, w, coords, n);
+    });
+}

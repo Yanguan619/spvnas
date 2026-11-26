@@ -85,7 +85,6 @@ include_directories(
 
 set(SOURCES
     spconv_devox_v4_torch.cpp
-    register.cpp
 )
 
 add_library(spconv_devox_v4_ops SHARED ${SOURCES})

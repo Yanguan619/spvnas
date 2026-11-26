@@ -10,7 +10,6 @@
 #include <torch/extension.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
-#include "spconv_query_ops.h"
 
 #ifndef UNUM_VENDOR_DIR
 #define UNUM_VENDOR_DIR "spconv_query"
@@ -140,3 +139,18 @@ at::Tensor spconv_query(const at::Tensor& qcoords, const at::Tensor& rkeys,
 }
 
 }  // namespace ascend_kernel
+
+
+// ---- torch 算子注册（原 register.cpp，合并以减少文件数）----
+TORCH_LIBRARY_FRAGMENT(npu, m) {
+    m.def("spconv_query(Tensor qcoords, Tensor rkeys, Tensor start, Tensor cnt, "
+          "Tensor meta) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(npu, PrivateUse1, m) {
+    m.impl("spconv_query", [](const at::Tensor& qcoords, const at::Tensor& rkeys,
+                              const at::Tensor& start, const at::Tensor& cnt,
+                              const at::Tensor& meta) {
+        return ascend_kernel::spconv_query(qcoords, rkeys, start, cnt, meta);
+    });
+}

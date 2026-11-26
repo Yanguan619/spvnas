@@ -12,7 +12,6 @@
 #include <torch/extension.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
-#include "spconv_sortdedup_v3_ops.h"
 #ifndef UNUM_VENDOR_DIR
 #define UNUM_VENDOR_DIR "spconv_sortdedup_v3"
 #endif
@@ -170,3 +169,14 @@ std::vector<at::Tensor> spconv_sortdedup_v3(const at::Tensor& coords)
     return {out, u.narrow(0, 0, 1)};
 }
 }  // namespace ascend_kernel
+
+
+// ---- torch 算子注册（原 register.cpp，合并以减少文件数）----
+TORCH_LIBRARY_FRAGMENT(npu, m) {
+    m.def("spconv_sortdedup_v3(Tensor coords) -> Tensor[]");
+}
+TORCH_LIBRARY_IMPL(npu, PrivateUse1, m) {
+    m.impl("spconv_sortdedup_v3", [](const at::Tensor& coords) {
+        return ascend_kernel::spconv_sortdedup_v3(coords);
+    });
+}

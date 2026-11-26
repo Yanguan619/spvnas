@@ -85,7 +85,6 @@ include_directories(
 
 set(SOURCES
     spconv_query_torch.cpp
-    register.cpp
 )
 
 add_library(spconv_query_ops SHARED ${SOURCES})

@@ -47,8 +47,6 @@ _PROF = {} if os.environ.get("TS_PROF") else None
 _GATHER_SO = _OPS_ROOT + "/csrc/ascend/spconv_gather/op_extension/build/libspconv_gather_ops.so"
 from ... import _fgstatic as _fg         # 整模入图：数据相关值静态化
 
-_GRAPH = bool(os.environ.get("TS_GRAPH"))
-_DYNAMIC = os.environ.get("TS_DYNAMIC", "1") != "0"
 # The 910B gather op is the fastest path (177-188 ms vs 290-320 ms at 20k
 # voxels), so it is on by default; TS_GATHER=0 forces the torch path.
 _GATHER = os.environ.get("TS_GATHER", "1") != "0"
@@ -69,12 +67,6 @@ def _fused_op():
     if _FUSED_OK is None:
         _FUSED_OK = _load_cap_so("fused")
     return _FUSED_OK
-if _GRAPH and _DYNAMIC:
-    # ACL graph fixes tensor addresses, but this op's output shape (M, K*cin)
-    # differs per layer, so one dynamic graph cannot cover it (verified:
-    # aclnnInplaceCopy shape mismatch). Fall back to the torch path instead of
-    # crashing; TS_DYNAMIC=0 gives per-shape graphs, where the op does work.
-    _GATHER = False
 _GATHER_OK = None
 
 
@@ -176,43 +168,6 @@ def _gather_op():
 
 _DENSE = bool(os.environ.get("TS_DENSE"))
 _UNIQ_MODE = os.environ.get("TS_UNIQ", "dense")
-_GRAPH_FNS = {}
-
-
-def _compiled(fn):
-    """TorchAir graph replay for a function with static *op* structure (opt-in,
-    TS_GRAPH=1).
-
-    dynamic=True keeps one graph per function instead of one per shape (the
-    model has ~30 conv shapes); only functions without host round-trips may go
-    through here, since graph capture forbids H2D/D2H copies."""
-    import time
-
-    import torch_npu
-    from torchair import CompilerConfig, get_npu_backend
-
-    torch._dynamo.config.cache_size_limit = 64
-    torch_npu.npu.set_compile_mode(jit_compile=False)   # no second-stage JIT
-    cfg = CompilerConfig()
-    cfg.mode = os.environ.get("TS_MODE", "reduce-overhead")
-    dyn = _DYNAMIC   # single source of truth (env read once, at import)
-    t0 = time.time()
-    cfn = torch.compile(fn, backend=get_npu_backend(compiler_config=cfg),
-                        dynamic=dyn, fullgraph=os.environ.get("TS_FULLGRAPH", "0") == "1")
-    cfn._ts_compile_seconds = time.time() - t0
-    print(f"[graph] compiled <{fn.__name__}> dynamic={dyn} "
-          f"in {cfn._ts_compile_seconds:.1f}s", flush=True)
-    return cfn
-
-
-def _graph_call(tag, fn, *args):
-    if not _GRAPH:
-        return fn(*args)
-    ent = _GRAPH_FNS.get(tag)
-    if ent is None:
-        ent = _compiled(fn)
-        _GRAPH_FNS[tag] = ent
-    return ent(*args)
 
 
 def _now():
@@ -313,61 +268,9 @@ def _const_tensor(vals, dtype, device):
     return t
 
 
-def _ge_compat():
-    """TS_GE_COMPAT=1 时启用 GE 兼容写法（amin/amax、>> 等不在 TorchAir ATen 清单里）。"""
-    import os
-    return os.environ.get("TS_GE_COMPAT", "0") == "1"
-
-
-_LOHI_CACHE = {}
-
-
 def _lo_hi(t, cache=False):
-    """amin/amax 的 GE 友好替代（int32 也适用）。
-
-    TorchAir 的 ATen 支持清单没有 torch.amin/amax；torch.max 又不支持 int32。
-    先 _to_copy 到 int64（全 dtype 支持），上界 torch.max，下界用 0-(max(0-t))
-    绕开不在清单里的 aten::neg，最后转回原 dtype。
-    常量张量（如 offsets）按 data_ptr 缓存，避免每层重复算。
-    """
-    if not _ge_compat():
-        # 生产路径：amin/amax 最快（aclgraph 支持）；GE 才走下面的替代实现
-        return t.amin(0), t.amax(0)
-    if t.numel() == 0:
-        z = t.new_zeros(t.shape[1:])
-        return z, z
-    key = None
-    if cache:
-        key = (t.data_ptr(), tuple(t.shape), str(t.dtype))
-        hit = _LOHI_CACHE.get(key)
-        if hit is not None:
-            return hit
-    t64 = t.to(torch.int64)
-    zero = torch.zeros_like(t64)
-    hi = torch.max(t64, dim=0).values
-    lo = zero[0] - torch.max(zero - t64, dim=0).values
-    if t.dtype != torch.int64:
-        lo, hi = lo.to(t.dtype), hi.to(t.dtype)
-    if key is not None:
-        _LOHI_CACHE[key] = (lo, hi)
-    return lo, hi
-
-
-def _pad_cin_to_8(feats, w):
-    """把输入通道零填充到 8 的倍数，让 _GATHER 快路径（spconv_gather_gemm）生效。
-
-    stem 第一层是 Conv3d(4, ...) → cin=4，不满足 `% 8 == 0`，只有这一层会掉进
-    `_kernel_map` 回退（sort/index_add_/cat…）。补零通道后结果完全等价：
-    多出来的输入通道全 0、对应权重也全 0。
-    """
-    cin = feats.shape[1]
-    if cin % 8 == 0:
-        return feats, w
-    pad = 8 - cin % 8
-    f2 = torch.cat([feats, feats.new_zeros(feats.shape[0], pad)], dim=1)
-    # w: [kv, cin, cout]
-    w2 = torch.cat([w, w.new_zeros(w.shape[0], pad, w.shape[2])], dim=1)
-    return f2, w2
+    """(min, max) over dim 0；cache 参数仅为兼容既有调用方保留。"""
+    return t.amin(0), t.amax(0)
 
 
 def _lookup_offsets(in_coords, out_coords, stride, offsets):
@@ -573,8 +476,7 @@ def _kernel_map(in_coords, out_coords, ks, stride, dilation, n_in=None, pad="red
 
 
 def _apply_forward(feats, weight, kmap, n_out, nb=None, n_real=None):
-    return _graph_call("conv_fwd", _apply_forward_eager, feats, weight, kmap, n_out, nb,
-                       n_real)
+    return _apply_forward_eager(feats, weight, kmap, n_out, nb, n_real)
 
 
 def _apply_forward_eager(feats, weight, kmap, n_out, nb=None, n_real=None):
@@ -688,14 +590,6 @@ def conv3d(input, weight, kernel_size, bias=None, stride=1, dilation=1,
                  < n_in.reshape(())).unsqueeze(1)
         feats = torch.where(_keep, feats,
                             torch.zeros((), dtype=feats.dtype, device=feats.device))
-    # cin 不是 8 的倍数（stem 第一层 Conv3d(4, ...)）时补零到 8 的倍数，
-    # 让 _GATHER 快路径（spconv_gather_gemm）生效；多余通道输入/权重都是 0，结果等价。
-    # _pad_cin_to_8 只在 GE 兼容模式下启用：它会把 stem 从 `_kernel_map` 切到 SGG 快路径，
-    # 而 SGG 那条路上 keyprep 有一次普通 D2H（未被 _fg 冻结），aclgraph capture 期会失败。
-    if (_ge_compat() and _GATHER and coords.device.type == "npu"
-            and feats.shape[1] % 8 != 0 and _gather_op()):
-        feats, w = _pad_cin_to_8(feats, w)
-
     if ks == (1, 1, 1) and st == (1, 1, 1) and dl == (1, 1, 1):
         out = feats @ w[0]
         out_coords, out_stride = coords, input.stride
@@ -870,7 +764,7 @@ def calc_ti_weights(coords, idx_query, scale=1):
 
 
 def spdevoxelize(feats, coords, weights):
-    return _graph_call("devox", _spdevoxelize_eager, feats, coords, weights)
+    return _spdevoxelize_eager(feats, coords, weights)
 
 
 _DEVOX = os.environ.get("TS_DEVOX", "1") != "0"

@@ -173,10 +173,6 @@ def _sortdedup_kernel(coords):
     1.06x-5.94x per level, and 38 -> 2 kernels per call (launch-bound elsewhere).
     """
     out, u = torch.ops.npu.spconv_sortdedup_v3(coords.to(torch.int32).contiguous())
-    if _fg.MODE == "replay":
-        # 图模式：U 在 record 阶段已固化；这里绝不能碰 u —— tracing 时 u 会被
-        # dynamo 提成 CPU 常量再 H2D，而 aclgraph 捕获期禁止同步 H2D（107030）。
-        return out[:_fg.get(("u", tuple(coords.shape)))]
     return out[:_fg.const(lambda: int(u), ("u", tuple(coords.shape)))]
 
 

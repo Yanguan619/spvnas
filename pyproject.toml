@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spvnas-core"
+version = "0.1.0"
+description = "SPVNAS/SPVCNN sparse point-voxel CNN (Ascend NPU adapted)"
+requires-python = ">=3.10"
+dependencies = ["torch", "numpy"]
+
+# 推理/评测只需要 torch + numpy；上游训练与官方评测入口（train.py / evaluate*.py /
+# core.builder|trainers|callbacks|schedulers）额外依赖 torchpack，按需安装：
+#   pip install -e ".[train]"
+[project.optional-dependencies]
+train = ["torchpack"]
+
+# 构建钩子：pip install 时自动编译 AscendC 算子并装入 core/ops/
+#   跳过：SPVNAS_SKIP_ASCENDC_BUILD=1
+#   只编某个：SPVNAS_ASCENDC_ONLY=spconv_query
+[tool.setuptools.cmdclass]
+build_py = "setup_hooks.build_py"
+editable_wheel = "setup_hooks.editable_wheel"
+
+[tool.setuptools]
+# import 名为 core，与源码保持一致（不改任何 import、不改目录名）
+packages = [
+    "core",
+    "core.datasets",
+    "core.models",
+    "core.modules",
+    "core.ops",
+]
+
+# AscendC 算子产物随包分发：构建后由 ascendc_kernels/build_ascendc.py 复制进 core/ops/
+[tool.setuptools.package-data]
+"core.ops" = ["*.so"]

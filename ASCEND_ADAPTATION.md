@@ -646,8 +646,19 @@ python fill_missing.py        # 补齐缺失帧
      **算子路径与真值吻合到 3e-07（1200/1200 行全对）**，**纯 torch 路径与 4 种约定
      全不匹配**（最好 2.40，1200/1200 行全错）→ 是纯 torch 的 conv3d 实现本身算错，
      不是索引约定差异。
-   - **邻域表已排除**：直接对拍 `_lookup_offsets` 的产出（1200×27），
-     **算子路径与纯 torch 路径 100% 一致**（32400 格 0 差异）→ 表不是缺陷源。
+   - **已修复（bug #1）**：`functional._table_fill` 写入的是**降序**行号
+     （`arange(n-1,-1,-1)`），使 `table[key] = n-1-row`，于是 `_lookup_offsets`
+     产出的邻域表整体反序 —— 实测与字典真值一致率 **0%**（N=200/500 两组）。
+     同文件 `lookup()` 分支返回 `order[pos]`（原始行号，正确），两分支本应逐位一致。
+     改为升序 `arange(n)` 后：邻域表 **100% 正确**、单层 conv3d 与真值差 **1.8e-07**。
+     该修复已入库（`test_conv3d_repro.py` 可复现验证）。
+   - **修复后整模仍只有 32.09%**（原 30.20%），逐层 dump 显示首个偏差从
+     idx=11（level-0 conv）**后移到 idx=30（`spdevoxelize`）** → 还有第二处缺陷。
+   - **第二处线索**：`spdevoxelize` 本身隔离测试是对的（1e-7），差的是它的输入
+     `idx_query`（来自 `sphashquery` → `backend._query_args`）。`_query_args`
+     的纯 torch 分支返回的 `rkeys` 是**原始顺序**、而 `start` 是按**桶前缀**算的，
+     这一对只有消费者（AscendC 的 `spconv_query`）内部排序后才自洽；
+     纯 torch 消费端若不排序就会查错。待验证。
    - **缺陷在多处**：`有算子 + TS_GATHER=0`（同样走 `_kernel_map` + `_apply_forward_eager`）
      OA 42.61%，而纯 torch 只有 30.20% —— 两条路走同一段卷积代码却差 12 个百分点，
      说明纯 torch 路径上**除卷积应用之外的算子（devox / downsample / sortdedup）也有错**。

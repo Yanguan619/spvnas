@@ -284,8 +284,11 @@ def _table_fill(total, in_coords, mins, dims, device):
     if prev is not None:
         table[prev] = -1
     keys = pack_keys(in_coords, mins, dims)
-    table[keys] = torch.arange(in_coords.shape[0] - 1, -1, -1, dtype=torch.int32,
-                               device=device)
+    # 必须是**升序**行号：table[key] = 该行的原始行号。
+    # 原实现写成降序（arange(n-1,-1,-1)），导致 table[key] = n-1-row，
+    # 于是 _lookup_offsets 生成的邻域表整体反序（实测 100% 错位），
+    # 而 lookup() 分支返回 order[pos] 是原始行号 —— 两支不一致。
+    table[keys] = torch.arange(in_coords.shape[0], dtype=torch.int32, device=device)
     _TABLES[total] = [table, keys]
     return table
 

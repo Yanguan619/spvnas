@@ -255,10 +255,12 @@ def dense_lookup(total, in_coords, mins, dims, qkeys):
     if prev is not None:
         table[prev] = -1
     keys = pack_keys(in_coords, mins, dims)
-    # 降序写入：重复键时最后一次写生效 → 存的是**最小**（真实）行号。
-    # 这样 padding 行（尾部重复）永远不会抢走真实键的映射，各处不必再做重定向。
-    table[keys] = torch.arange(in_coords.shape[0] - 1, -1, -1, dtype=torch.int32,
-                               device=in_coords.device)
+    # 重复键时希望存**最小**（真实）行号（padding 行是尾部重复，不能抢走真实键），
+    # 做法是「按下标降序写入、值写自己的行号」：最后一次写的是最小下标。
+    # 注意必须同时翻转索引侧，否则唯一键会得到 n-1-row —— 整表反序（实测 100% 错位）。
+    _rows = torch.arange(in_coords.shape[0] - 1, -1, -1, dtype=torch.int32,
+                         device=in_coords.device)
+    table[keys.flip(0)] = _rows
     _TABLES[total] = [table, keys]
     return table[qkeys].long()
 

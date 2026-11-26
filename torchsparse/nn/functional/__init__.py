@@ -288,7 +288,12 @@ def _table_fill(total, in_coords, mins, dims, device):
     # 原实现写成降序（arange(n-1,-1,-1)），导致 table[key] = n-1-row，
     # 于是 _lookup_offsets 生成的邻域表整体反序（实测 100% 错位），
     # 而 lookup() 分支返回 order[pos] 是原始行号 —— 两支不一致。
-    table[keys] = torch.arange(in_coords.shape[0], dtype=torch.int32, device=device)
+    # table[key] 必须是该行的原始行号。重复键时想存**最小**行号（padding 尾部重复
+    # 不能抢走真实键），所以按下标降序写入、值写自己的行号；索引侧必须同步翻转，
+    # 否则唯一键会得到 n-1-row，整表反序（实测 100% 错位）。
+    _rows = torch.arange(in_coords.shape[0] - 1, -1, -1, dtype=torch.int32,
+                         device=device)
+    table[keys.flip(0)] = _rows
     _TABLES[total] = [table, keys]
     return table
 

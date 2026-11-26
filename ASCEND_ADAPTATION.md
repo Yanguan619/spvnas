@@ -632,41 +632,28 @@ python fill_missing.py        # 补齐缺失帧
 
 ## 8. 已知限制
 
-0. **纯 torch 后端（不装 AscendC 算子）精度不正确** —— 能跑通，但序列 08 前 3 帧
-   **OA 30.20%**（装载算子后 **89.54%**），整帧耗时也从 100.1 涨到 538 ms。
-   定位结果：
-   - 逐层 dump 显示**前 11 个算子输出完全一致**，首个偏差出现在 **level-0 的第一个
-     3×3×3 卷积**（42166×32），且该层 100% 行都不同 → 问题在「邻域表 / gather」
-     这条路径，而不是前面的 1×1×1 MLP；
-   - 关闭 `TS_GATHER` / `TS_FUSED` / `TS_DECONV_INV` **对无算子路径毫无影响**（仍是 30.20%），
-     说明不是开关误开，而是纯 torch 实现本身算错；
-   - 反过来，**有算子但关掉 gather** 时 OA 42.61% → gather 算子是最主要的正确贡献者。
-   - **已建立真值基准**（`test_conv3d_repro.py`，1200 体素 / 8 通道 / 3×3×3 固定权重）：
-     kernel 索引约定为 **x-major**：`k = ((x+1)*3 + (y+1))*3 + (z+1)`；
-     **算子路径与真值吻合到 3e-07（1200/1200 行全对）**，**纯 torch 路径与 4 种约定
-     全不匹配**（最好 2.40，1200/1200 行全错）→ 是纯 torch 的 conv3d 实现本身算错，
-     不是索引约定差异。
-   - **已修复（bug #1）**：`functional._table_fill` 写入的是**降序**行号
-     （`arange(n-1,-1,-1)`），使 `table[key] = n-1-row`，于是 `_lookup_offsets`
-     产出的邻域表整体反序 —— 实测与字典真值一致率 **0%**（N=200/500 两组）。
-     同文件 `lookup()` 分支返回 `order[pos]`（原始行号，正确），两分支本应逐位一致。
-     改为升序 `arange(n)` 后：邻域表 **100% 正确**、单层 conv3d 与真值差 **1.8e-07**。
-     该修复已入库（`test_conv3d_repro.py` 可复现验证）。
-   - **修复后整模仍只有 32.09%**（原 30.20%），逐层 dump 显示首个偏差从
-     idx=11（level-0 conv）**后移到 idx=30（`spdevoxelize`）** → 还有第二处缺陷。
-   - **第二处线索**：`spdevoxelize` 本身隔离测试是对的（1e-7），差的是它的输入
-     `idx_query`（来自 `sphashquery` → `backend._query_args`）。`_query_args`
-     的纯 torch 分支返回的 `rkeys` 是**原始顺序**、而 `start` 是按**桶前缀**算的，
-     这一对只有消费者（AscendC 的 `spconv_query`）内部排序后才自洽；
-     纯 torch 消费端若不排序就会查错。待验证。
-   - **缺陷在多处**：`有算子 + TS_GATHER=0`（同样走 `_kernel_map` + `_apply_forward_eager`）
-     OA 42.61%，而纯 torch 只有 30.20% —— 两条路走同一段卷积代码却差 12 个百分点，
-     说明纯 torch 路径上**除卷积应用之外的算子（devox / downsample / sortdedup）也有错**。
-   - **未定位到具体行**：卷积应用侧（`_apply_forward_eager`）与 devox/downsample 侧都还需
-     各自对拍，留待后续。
-   - 已用 `npu_patches.install(require_ops=True)`（三个交付脚本默认开启）把静默错结果变成
-     明确报错，避免使用者拿到 30% 的假精度。
+0. ~~纯 torch 后端精度不正确~~ —— **已修复**（两处同源 bug）。
 
+   **现象**：不装 AscendC 算子时可跑通但 OA 30.20%（装载后 89.54%），整帧 538 vs 100.1 ms。
+
+   **根因（两处，同一模式）**：`table[keys] = arange(n-1, -1, -1)` 只翻转了**值**、没翻转
+   **索引侧**，于是唯一键得到 `table[key_j] = n-1-j` —— 整张查找表反序。原意是「重复键时存最小
+   行号（padding 尾部重复不能抢走真实键）」，正确写法必须同时翻转索引：
+   `table[keys.flip(0)] = arange(n-1, -1, -1)`。
+
+   | 位置 | 影响 |
+   |---|---|
+   | `backend.dense_lookup` | `sphashquery`/`lookup_coords` 的稠密查表（PCNN 的 `idx_query`） |
+   | `nn/functional._table_fill` | `_lookup_offsets` 的邻域表（稀疏卷积 gather） |
+
+   **验证**：
+   - 邻域表与手写字典真值：修复前一致率 **0%**（N=200/500 两组），修复后 **100%**；
+   - 单层 `conv3d` 与真值：修复后 **1.8e-07**；
+   - **整模 3 帧：纯 torch 由 30.20% → 89.54%，与装载算子路径的 mIoU/OA 完全相同**。
+
+   **交付影响**：`npu_patches.install(require_ops=True)` 的强校验**保留**——它仍然能在算子
+   缺失时尽早暴露环境问题；但纯 torch 回退路径现在已是**正确**的，可用于无算子环境的冒烟与
+   小规模评测。
 
 1. **CAP 是上限**：`N > CAP` 需要更大的 CAP（重编一张图）。分档即为此；
 2. **GE 静态每档一张图**；可选优化：把 CAP 改成从输入形状派生 + `set_dim_gears`，

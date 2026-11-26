@@ -44,7 +44,6 @@ _TABLES = {}                           # size -> [table, keys written last time]
 _N_TABLES = 4
 
 _PROF = {} if os.environ.get("TS_PROF") else None
-_GATHER_SO = _OPS_ROOT + "/csrc/ascend/spconv_gather/op_extension/build/libspconv_gather_ops.so"
 from ... import _fgstatic as _fg         # 整模入图：数据相关值静态化
 
 # The 910B gather op is the fastest path (177-188 ms vs 290-320 ms at 20k
@@ -58,7 +57,6 @@ _GATHER = os.environ.get("TS_GATHER", "1") != "0"
 _FUSED = os.environ.get("TS_FUSED") == "1"
 # 转置卷积：取逆映射 + 一次 gather_gemm（替代逐 offset index_select+index_add）
 _TS_DECONV_INV = os.environ.get("TS_DECONV_INV", "0") != "0"
-_FUSED_SO = _OPS_ROOT + "/csrc/ascend/spconv_fused/op_extension/build/libspconv_fused_ops.so"
 _FUSED_OK = None
 
 
@@ -70,7 +68,6 @@ def _fused_op():
 _GATHER_OK = None
 
 
-_SGG_SO = _OPS_ROOT + "/csrc/ascend/spconv_gather_gemm/op_extension/build/libspconv_gather_gemm_ops.so"
 _SGG = os.environ.get("TS_SGG", "1") != "0"
 _SGG_OK = None
 
@@ -125,7 +122,6 @@ def _load_cap_so(op):
     return False
 
 
-_SGG2_SO = _OPS_ROOT + "/csrc/ascend/spconv_gather_gemm_v2/op_extension/build/libspconv_gather_gemm_v2_ops.so"
 _SGG2_OK = None
 
 
@@ -352,18 +348,14 @@ def _fused_args(in_coords, out_coords, ks, stride, dilation):
 
 
 _QUERY = os.environ.get("TS_QUERY", "1") != "0"
-_QUERY_SO = _OPS_ROOT + "/csrc/ascend/spconv_query/op_extension/build/libspconv_query_ops.so"
 _QUERY_OK = None
 
 
 def _query_op():
+    """spconv_query 是否可用（经 _op_so_candidates 查找，不再依赖 UNUM_OPS_ROOT）。"""
     global _QUERY_OK
     if _QUERY_OK is None:
-        try:
-            torch.ops.load_library(_QUERY_SO)
-            _QUERY_OK = hasattr(torch.ops.npu, "spconv_query")
-        except Exception:
-            _QUERY_OK = False
+        _QUERY_OK = _load_cap_so("query")
     return _QUERY_OK
 
 
@@ -875,25 +867,16 @@ def cap_refill_sentinel(coords_cap, u):
     j = (u.reshape(()).to(torch.long) - 1).clamp(min=0)
     tail = torch.gather(coords_cap, 0, j.expand(1, coords_cap.shape[1]))
     return torch.where(keep, coords_cap, tail)
-_DEVOX_SO = {
-    "1": (_OPS_ROOT + "/csrc/ascend/spconv_devox/op_extension/build/libspconv_devox_ops.so"),
-    "2": (_OPS_ROOT + "/csrc/ascend/spconv_devox_v2/op_extension/build/libspconv_devox_v2_ops.so"),
-    "3": (_OPS_ROOT + "/csrc/ascend/spconv_devox_v3/op_extension/build/libspconv_devox_v3_ops.so"),
-    "4": (_OPS_ROOT + "/csrc/ascend/spconv_devox_v4/op_extension/build/libspconv_devox_v4_ops.so"),
-}.get(_DEVOX_V, None)
-_DEVOX_OP = {"1": "spconv_devox", "2": "spconv_devox_v2",
-             "3": "spconv_devox_v3", "4": "spconv_devox_v4"}.get(_DEVOX_V, "spconv_devox_v3")
+_DEVOX_NAME = {"1": "devox", "2": "devox_v2",
+               "3": "devox_v3", "4": "devox_v4"}.get(_DEVOX_V, "devox_v3")
 _DEVOX_OK = None
 
 
 def _devox_op():
+    """spconv_devox* 是否可用（经 _op_so_candidates 查找）。"""
     global _DEVOX_OK
     if _DEVOX_OK is None:
-        try:
-            torch.ops.load_library(_DEVOX_SO)
-            _DEVOX_OK = hasattr(torch.ops.npu, _DEVOX_OP)
-        except Exception:
-            _DEVOX_OK = False
+        _DEVOX_OK = _load_cap_so(_DEVOX_NAME)
     return _DEVOX_OK
 
 

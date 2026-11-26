@@ -26,18 +26,32 @@ _N_TABLES = 4
 
 
 # 容量化去重（TS_CAP 路径用）：输出固定 CAP 行，真实去重数在 device 的 u 里
-_SD4_SO = _OPS_ROOT + "/csrc/ascend/spconv_sortdedup_v4/op_extension/build/libspconv_sortdedup_v4_ops.so"
 _SD4_OK = None
+
+
+def _load_op_so(name):
+    """按候选路径加载算子 .so（core/ops → 源码树 → SPVNAS_OPS_ROOT/UNUM_OPS_ROOT）。"""
+    full = name if name.startswith("spconv_") else "spconv_" + name
+    if hasattr(torch.ops.npu, full):
+        return True
+    from ..nn.functional import _op_so_candidates  # 延迟导入，避免与 functional 循环依赖
+    for so in _op_so_candidates(full):
+        if not os.path.exists(so):
+            continue
+        try:
+            torch.ops.load_library(so)
+        except Exception:
+            continue
+        if hasattr(torch.ops.npu, full):
+            return True
+    return False
 
 
 def _sd4_op():
     global _SD4_OK
     if _SD4_OK is None:
-        try:
-            torch.ops.load_library(_SD4_SO)
-            _SD4_OK = hasattr(torch.ops.npu, "spconv_sortdedup_v4")
-        except Exception:
-            _SD4_OK = False
+        _SD4_OK = _load_op_so("spconv_sortdedup_v4")
+
     return _SD4_OK
 
 
@@ -59,18 +73,14 @@ def unique_coords_cap(coords_cap, n):
     return out, u
 
 
-_DEDUP_SO = _OPS_ROOT + "/csrc/ascend/spconv_dedup_v2/op_extension/build/libspconv_dedup_v2_ops.so"
 _DEDUP_OK = None
 
 
 def _dedup_op():
     global _DEDUP_OK
     if _DEDUP_OK is None:
-        try:
-            torch.ops.load_library(_DEDUP_SO)
-            _DEDUP_OK = hasattr(torch.ops.npu, "spconv_dedup_v2")
-        except Exception:
-            _DEDUP_OK = False
+        _DEDUP_OK = _load_op_so("spconv_dedup_v2")
+
     return _DEDUP_OK
 
 
@@ -97,7 +107,6 @@ def _row_sort_key(coords):
     return order[torch.argsort(hi[order].float(), stable=True)]
 
 
-_SD_SO = _OPS_ROOT + "/csrc/ascend/spconv_sortdedup_v3/op_extension/build/libspconv_sortdedup_v3_ops.so"
 # v2: the v1 global barrier needed all 40 AIV resident and spun 1e8 times
 # (~70 s) when one was busy. v2 bounds the spin, reports failure through
 # u[1] and the extension raises -> the caller falls back to torch.
@@ -139,11 +148,8 @@ _SD_OK = None
 def _sd_op():
     global _SD_OK
     if _SD_OK is None:
-        try:
-            torch.ops.load_library(_SD_SO)
-            _SD_OK = hasattr(torch.ops.npu, "spconv_sortdedup_v3")
-        except Exception:
-            _SD_OK = False
+        _SD_OK = _load_op_so("spconv_sortdedup_v3")
+
     return _SD_OK
 
 
@@ -297,7 +303,6 @@ def pack_keys(coords, mins, dims):
     return (((b.long() * d[1] + x.long()) * d[2] + y.long()) * d[3] + z.long())
 
 
-_NB_SO = _OPS_ROOT + "/csrc/ascend/spconv_nb/op_extension/build/libspconv_nb_ops.so"
 _NB_OK = None
 _NB_META = {}
 
@@ -305,11 +310,8 @@ _NB_META = {}
 def _nb_op():
     global _NB_OK
     if _NB_OK is None:
-        try:
-            torch.ops.load_library(_NB_SO)
-            _NB_OK = hasattr(torch.ops.npu, "spconv_nb")
-        except Exception:
-            _NB_OK = False
+        _NB_OK = _load_op_so("spconv_nb")
+
     return _NB_OK
 
 
@@ -373,22 +375,17 @@ def _shr(x, k):
     return x >> k
 
 
-_QUERY_SO = _OPS_ROOT + "/csrc/ascend/spconv_query/op_extension/build/libspconv_query_ops.so"
 _QUERY_OK = None
 
 
 def _query_op():
     global _QUERY_OK
     if _QUERY_OK is None:
-        try:
-            torch.ops.load_library(_QUERY_SO)
-            _QUERY_OK = hasattr(torch.ops.npu, "spconv_query")
-        except Exception:
-            _QUERY_OK = False
+        _QUERY_OK = _load_op_so("spconv_query")
+
     return _QUERY_OK
 
 
-_KPREP_SO = _OPS_ROOT + "/csrc/ascend/spconv_keyprep_v2/op_extension/build/libspconv_keyprep_v2_ops.so"
 _KPREP = os.environ.get("TS_KPREP", "1") != "0"
 _KPREP_OK = None
 
@@ -396,11 +393,8 @@ _KPREP_OK = None
 def _kprep_op():
     global _KPREP_OK
     if _KPREP_OK is None:
-        try:
-            torch.ops.load_library(_KPREP_SO)
-            _KPREP_OK = hasattr(torch.ops.npu, "spconv_keyprep_v2")
-        except Exception:
-            _KPREP_OK = False
+        _KPREP_OK = _load_op_so("spconv_keyprep_v2")
+
     return _KPREP_OK
 
 

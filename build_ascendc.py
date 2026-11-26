@@ -47,6 +47,41 @@ def _lf(path):
         pass
 
 
+def _install_vendor_run(op_dir, verbose=True):
+    """把 build_out/custom_opp_*.run 安装进 CANN 的 opp/vendors（aclnn 库由此检索）。
+
+    torch 绑定运行期是 dlopen ``<opp>/vendors/<vendor>/op_api/lib/libcust_opapi.so``
+    再取 aclnn 符号；只编不装，干净机器上首次调用会报 symbols not found。
+    """
+    if os.environ.get("SPVNAS_SKIP_OPP_INSTALL") == "1":
+        return True
+    runs = sorted((op_dir / "build_out").glob("custom_opp_*.run"))
+    if not runs:
+        if verbose:
+            print("    [skip] 未找到 build_out/custom_opp_*.run，跳过 vendor 安装")
+        return False
+    run = runs[0]
+    opp = os.environ.get("OPP_ROOT") or (os.environ.get("ASCEND_HOME_PATH", "").rstrip("/") + "/opp")
+    if not os.path.isdir(opp):
+        if verbose:
+            print("    [skip] opp 目录不存在：%s" % opp)
+        return False
+    for cmd in (["bash", str(run), "--install-path=%s" % opp],
+                ["bash", str(run), "--quiet", "--install-path=%s" % opp],
+                ["bash", str(run), "--quiet"]):
+        try:
+            rc = subprocess.call(cmd)
+        except Exception:
+            rc = 1
+        if rc == 0:
+            if verbose:
+                print("    [installed] %s -> %s/vendors/" % (run.name, opp))
+            return True
+    if verbose:
+        print("    [WARN] vendor 包装载失败：%s" % run.name)
+    return False
+
+
 def build(dirs, keep_going=True):
     # 共享脚本与各算子 build.sh 都必须是 LF
     _lf(SRC / "build_torch_binding.sh")
@@ -66,6 +101,7 @@ def build(dirs, keep_going=True):
         else:
             so = so_path(d)
             print("    [OK] %.1fs  %s" % (dt, so.name if so else "（未找到产物）"), flush=True)
+            _install_vendor_run(d)
             ok += 1
     return ok, failed
 

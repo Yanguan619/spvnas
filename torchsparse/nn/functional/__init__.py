@@ -940,9 +940,14 @@ def _spdevoxelize_eager(feats, coords, weights):
                 # v4 多一个 device-n（真实点数），与容量化路径同一签名
                 _n = torch.tensor([int(idx.shape[1])], dtype=torch.int32,
                                   device=feats.device)
-                return torch.ops.npu.spconv_devox_v4(
+                out = torch.ops.npu.spconv_devox_v4(
                     feats.contiguous(), idx.to(torch.int32), w,
                     w.new_empty((1, 1)), _n)
+                # 内核按 32B 对齐把行宽补到 8 的倍数，返回的是列切片（非连续）；
+                # 非 8 对齐的层（每帧最后一层 c=19）在这里转连续，代价约 0.5 ms。
+                if feats.shape[1] % 8 != 0:
+                    out = out.contiguous()
+                return out
             return getattr(torch.ops.npu, _DEVOX_OP)(
                 feats.contiguous(), idx.to(torch.int32), w,
                 w.new_empty((1, 1)))

@@ -101,14 +101,15 @@ at::Tensor spconv_devox(const at::Tensor& feat, const at::Tensor& idx,
 
     const int64_t N = ix.size(1);
     const int64_t c = ft.size(1);
-    at::Tensor out = at::empty({N, c}, ft.options());
+    const int64_t cPad = (c + 7) / 8 * 8;   // 与 kernel/host 一致
+    at::Tensor outBuf = at::empty({N, cPad}, ft.options());
 
     aclTensor* fT = Wrap(ft, kAclFloat);
     aclTensor* iT = Wrap(ix, kAclInt32);
     aclTensor* wT = Wrap(wt, kAclFloat);
     aclTensor* cT = Wrap(cd, kAclFloat);
     aclTensor* nT = Wrap(nt, kAclInt32);
-    aclTensor* oT = Wrap(out, kAclFloat);
+    aclTensor* oT = Wrap(outBuf, kAclFloat);
 
     uint64_t wsSize = 0;
     aclOpExecutor* exec = nullptr;
@@ -132,7 +133,7 @@ at::Tensor spconv_devox(const at::Tensor& feat, const at::Tensor& idx,
         return ret;
     });
     cmd.Run();
-    return out;
+    return outBuf.narrow(1, 0, c);   // 列切片（非连续），调用方只做 argmax
 }
 
 }  // namespace ascend_kernel

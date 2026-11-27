@@ -21,6 +21,8 @@ using namespace AscendC;
 
 namespace {
 
+constexpr int64_t kRowsPerBlk = 8;   // 8 行 × ktot_ × 4B ≡ 0 (mod 32)
+
 class KernelSpconvGather {
 public:
     __aicore__ inline KernelSpconvGather(TPipe* pipe) : pipe_(pipe) {}
@@ -48,7 +50,8 @@ public:
             return;
         }
         const int64_t blockNum = static_cast<int64_t>(GetBlockNum());
-        const int64_t per = (M_ + blockNum - 1) / blockNum;
+        const int64_t perRaw = (M_ + blockNum - 1) / blockNum;
+        const int64_t per = (perRaw + kRowsPerBlk - 1) / kRowsPerBlk * kRowsPerBlk;
         const int64_t g0 = static_cast<int64_t>(GetBlockIdx()) * per;
         int64_t g1 = g0 + per;
         if (g1 > M_) {
@@ -67,28 +70,34 @@ public:
         whole.srcStride = 0;
         whole.dstStride = 0;
 
-        for (int64_t m = g0; m < g1; m++) {
-            LocalTensor<float> row = qRow_.AllocTensor<float>();
-            Duplicate(row, 0.0f, static_cast<int32_t>(ktot_));
+        for (int64_t base = g0; base < g1; base += kRowsPerBlk) {
+            int64_t rows = g1 - base;
+            if (rows > kRowsPerBlk) {
+                rows = kRowsPerBlk;
+            }
+            LocalTensor<float> buf = qRow_.AllocTensor<float>();
+            Duplicate(buf, 0.0f, static_cast<int32_t>(kRowsPerBlk * ktot_));
             SetFlag<HardEvent::V_MTE2>(evtV_);
             WaitFlag<HardEvent::V_MTE2>(evtV_);
-            const int64_t nbRow = m * kcnt_;
-            for (int64_t k = 0; k < kcnt_; k++) {
-                const int32_t src = nbGm_.GetValue(nbRow + k);
-                if (src < 0) {
-                    continue;
+            for (int64_t r = 0; r < rows; r++) {
+                const int64_t m = base + r;
+                const int64_t nbRow = m * kcnt_;
+                for (int64_t k = 0; k < kcnt_; k++) {
+                    const int32_t src = nbGm_.GetValue(nbRow + k);
+                    if (src < 0) {
+                        continue;
+                    }
+                    DataCopyPad(buf[r * ktot_ + k * cin_],
+                                featGm_[static_cast<int64_t>(src) * cin_], piece, pp);
                 }
-                DataCopyPad(row[k * cin_],
-                            featGm_[static_cast<int64_t>(src) * cin_], piece, pp);
             }
             SetFlag<HardEvent::MTE2_MTE3>(evtM_);
             WaitFlag<HardEvent::MTE2_MTE3>(evtM_);
-            DataCopyPad(outGm_[m * ktot_], row, whole);
-            // The row buffer is reused next iteration: the store must finish
-            // reading UB before the next Duplicate overwrites it.
+            whole.blockLen = static_cast<uint32_t>(kRowsPerBlk * ktot_ * sizeof(float));
+            DataCopyPad(outGm_[base * ktot_], buf, whole);
             SetFlag<HardEvent::MTE3_V>(evtO_);
             WaitFlag<HardEvent::MTE3_V>(evtO_);
-            qRow_.FreeTensor(row);
+            qRow_.FreeTensor(buf);
         }
     }
 

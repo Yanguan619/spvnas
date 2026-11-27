@@ -96,12 +96,13 @@ at::Tensor spconv_gather(const at::Tensor& feat, const at::Tensor& nb,
     const int64_t K = nb.size(1);
     const int64_t cin = feat.size(1);
 
-    at::Tensor out = at::empty({M, K * cin}, feat.options());
+    const int64_t mPad = (M + 7) / 8 * 8;   // 与 kernel/host 的 8 行对齐一致
+    at::Tensor outBuf = at::empty({mPad, K * cin}, feat.options());
 
     aclTensor* featT = WrapTensor(feat, kAclFloat);
     aclTensor* nbT = WrapTensor(nb, kAclInt32);
     aclTensor* paramsT = WrapTensor(params, kAclInt32);
-    aclTensor* outT = WrapTensor(out, kAclFloat);
+    aclTensor* outT = WrapTensor(outBuf, kAclFloat);
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
@@ -130,7 +131,7 @@ at::Tensor spconv_gather(const at::Tensor& feat, const at::Tensor& nb,
         return ret;
     });
     cmd.Run();
-    return out;
+    return outBuf.narrow(0, 0, M);   // 前缀切片，保持连续
 }
 
 }  // namespace ascend_kernel

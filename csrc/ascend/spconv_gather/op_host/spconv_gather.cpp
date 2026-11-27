@@ -61,7 +61,7 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
         return ge::GRAPH_FAILED;
     }
     outShape->SetDimNum(2);
-    outShape->SetDim(0, M);
+    outShape->SetDim(0, (M + 7) / 8 * 8);   // 8 行对齐：配合内核整块 DataCopyPad
     outShape->SetDim(1, K * cin);
     return GRAPH_SUCCESS;
 }

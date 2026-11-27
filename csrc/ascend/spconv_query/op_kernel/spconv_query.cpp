@@ -18,6 +18,7 @@ using namespace AscendC;
 namespace {
 
 constexpr int32_t kMaxK = 32;
+constexpr int64_t kRowsPerBlk = 8;   // DataCopyPad 对齐所需：8 行 × K_ × 4B ≡ 0 (mod 32)
 
 class KernelSpconvQuery {
 public:
@@ -51,7 +52,8 @@ public:
             off_[k][2] = static_cast<int64_t>(metaGm_.GetValue(14 + 3 * k));
         }
         if (M_ > 0 && K_ > 0) {
-            pipe_->InitBuffer(qRow_, 1, static_cast<uint32_t>(K_ * sizeof(int32_t)));
+            // 8 行一组写回：8*K_*4 字节必为 32B 的倍数，满足 DataCopyPad 目的地址对齐
+            pipe_->InitBuffer(qRow_, 1, static_cast<uint32_t>(kRowsPerBlk * K_ * sizeof(int32_t)));
         }
         evtV_ = pipe_->AllocEventID<HardEvent::V_MTE2>();
         evtM_ = pipe_->AllocEventID<HardEvent::MTE2_MTE3>();
@@ -93,39 +95,55 @@ public:
             return;
         }
         const int64_t blockNum = static_cast<int64_t>(GetBlockNum());
-        const int64_t per = (M_ + blockNum - 1) / blockNum;
+        // 每核起点必须是 8 的倍数，否则 DataCopyPad 的 GM 目的地址仍会错位
+        // （per 按 kRowsPerBlk 向上取整，保证 GetBlockIdx()*per % 8 == 0）。
+        const int64_t perRaw = (M_ + blockNum - 1) / blockNum;
+        const int64_t per = (perRaw + kRowsPerBlk - 1) / kRowsPerBlk * kRowsPerBlk;
         const int64_t g0 = static_cast<int64_t>(GetBlockIdx()) * per;
         int64_t g1 = g0 + per;
         if (g1 > M_) {
             g1 = M_;
         }
 
+        // DataCopyPad 的 GM 目的地址必须 32B 对齐：单行 K_=27 时行距仅 108 B，逐行写
+        // 会构成未对齐 GM 写（910B 上偶发 507035 aivec / MTE 非法地址，实测 10~1500
+        // 帧不等必现）。这里改为「8 行一组」整块写：8*K_*4 字节恒为 32B 倍数，
+        // 目的地址 m0*K_*4 也随 m0 按 8 递增而对齐。输出行数在 host/binding 侧补齐到
+        // 8 的倍数，torch 侧再用 narrow 切回 M 行（前缀切片，仍连续）。
         DataCopyPadExtParams<int32_t> pp;
         pp.isPad = false;
         DataCopyExtParams whole;
         whole.blockCount = 1;
-        whole.blockLen = static_cast<uint32_t>(K_ * sizeof(int32_t));
         whole.srcStride = 0;
         whole.dstStride = 0;
 
-        for (int64_t m = g0; m < g1; m++) {
-            const int64_t c4 = m * 4;
-            const int64_t b = static_cast<int64_t>(qGm_.GetValue(c4));
-            const int64_t xs = static_cast<int64_t>(qGm_.GetValue(c4 + 1)) * stride_[0];
-            const int64_t ys = static_cast<int64_t>(qGm_.GetValue(c4 + 2)) * stride_[1];
-            const int64_t zs = static_cast<int64_t>(qGm_.GetValue(c4 + 3)) * stride_[2];
-
-            LocalTensor<int32_t> row = qRow_.AllocTensor<int32_t>();
-            for (int64_t k = 0; k < K_; k++) {
-                const int64_t key = Key(b, xs + off_[k][0], ys + off_[k][1],
-                                        zs + off_[k][2]);
-                row.SetValue(static_cast<int32_t>(k), Find(key));
+        for (int64_t base = g0; base < g1; base += kRowsPerBlk) {
+            int64_t rows = g1 - base;
+            if (rows > kRowsPerBlk) {
+                rows = kRowsPerBlk;
+            }
+            LocalTensor<int32_t> buf = qRow_.AllocTensor<int32_t>();
+            for (int64_t r = 0; r < kRowsPerBlk; r++) {
+                const int64_t m = base + r;
+                for (int64_t k = 0; k < K_; k++) {
+                    int32_t v = -1;
+                    if (r < rows) {
+                        const int64_t c4 = m * 4;
+                        const int64_t b = static_cast<int64_t>(qGm_.GetValue(c4));
+                        const int64_t xs = static_cast<int64_t>(qGm_.GetValue(c4 + 1)) * stride_[0];
+                        const int64_t ys = static_cast<int64_t>(qGm_.GetValue(c4 + 2)) * stride_[1];
+                        const int64_t zs = static_cast<int64_t>(qGm_.GetValue(c4 + 3)) * stride_[2];
+                        v = Find(Key(b, xs + off_[k][0], ys + off_[k][1], zs + off_[k][2]));
+                    }
+                    buf.SetValue(static_cast<int32_t>(r * K_ + k), v);
+                }
             }
             PipeBarrier<PIPE_ALL>();   // 标量写 UB 之后再交给 MTE3
-            DataCopyPad(outGm_[m * K_], row, whole);
+            whole.blockLen = static_cast<uint32_t>(kRowsPerBlk * K_ * sizeof(int32_t));
+            DataCopyPad(outGm_[base * K_], buf, whole);
             SetFlag<HardEvent::MTE3_V>(evtO_);
             WaitFlag<HardEvent::MTE3_V>(evtO_);
-            qRow_.FreeTensor(row);
+            qRow_.FreeTensor(buf);
         }
     }
 

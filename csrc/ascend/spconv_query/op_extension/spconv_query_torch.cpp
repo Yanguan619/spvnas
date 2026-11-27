@@ -104,7 +104,9 @@ at::Tensor spconv_query(const at::Tensor& qcoords, const at::Tensor& rkeys,
 
     const int64_t M = qc.size(0);
     const int64_t kcnt = (mt.numel() - 12) / 3;
-    at::Tensor out = at::empty({M, kcnt}, qc.options());
+    const int64_t mPad = (M + 7) / 8 * 8;   // 与 kernel/host 的 8 行对齐一致
+    at::Tensor outBuf = at::empty({mPad, kcnt}, qc.options());
+    at::Tensor out = outBuf;
 
     aclTensor* qT = Wrap(qc, kAclInt32);
     aclTensor* rT = Wrap(rk, kAclInt64);
@@ -135,7 +137,7 @@ at::Tensor spconv_query(const at::Tensor& qcoords, const at::Tensor& rkeys,
         return ret;
     });
     cmd.Run();
-    return out;
+    return outBuf.narrow(0, 0, M);   // 前缀切片，保持连续
 }
 
 }  // namespace ascend_kernel

@@ -677,44 +677,60 @@ python fill_missing.py        # 补齐缺失帧
 
 ---
 
-## 8. 已知限制
+## 8. 已知问题
 
-0. ~~纯 torch 后端精度不正确~~ —— **已修复**（两处同源 bug）。
+### 8.1 单次长跑偶发 507035（aivec error）——已定位，部分修复
 
-   **现象**：不装 AscendC 算子时可跑通但 OA 30.20%（装载后 89.54%），整帧 538 vs 100.1 ms。
+**现象**：评测跑到 10~4000 帧不等时进程退出，`rc=0`、无 Python traceback；`--stats-jsonl`
+停止增长。开启 `ASCEND_GLOBAL_LOG_LEVEL=1` 后 plog 里能看到：
 
-   **根因（两处，同一模式）**：`table[keys] = arange(n-1, -1, -1)` 只翻转了**值**、没翻转
-   **索引侧**，于是唯一键得到 `table[key_j] = n-1-j` —— 整张查找表反序。原意是「重复键时存最小
-   行号（padding 尾部重复不能抢走真实键）」，正确写法必须同时翻转索引：
-   `table[keys.flip(0)] = arange(n-1, -1, -1)`。
+```
+aivec error, error code = 0x800000
+errorStr: MTE accesses an invalid GM address or the cross-device memory access times out
+rtStreamSynchronizeWithTimeout execution failed, reason=vector core exception (507035)
+```
 
-   | 位置 | 影响 |
-   |---|---|
-   | `backend.dense_lookup` | `sphashquery`/`lookup_coords` 的稠密查表（PCNN 的 `idx_query`） |
-   | `nn/functional._table_fill` | `_lookup_offsets` 的邻域表（稀疏卷积 gather） |
+**根因（两类，均已取证）**
 
-   **验证**：
-   - 邻域表与手写字典真值：修复前一致率 **0%**（N=200/500 两组），修复后 **100%**；
-   - 单层 `conv3d` 与真值：修复后 **1.8e-07**；
-   - **整模 3 帧：纯 torch 由 30.20% → 89.54%，与装载算子路径的 mIoU/OA 完全相同**；
-   - **整模 100 帧 A/B：两条路径均为 mIoU 48.30% / OA 91.64%（99 帧有效、同一张损坏帧
-     被跳过），逐位一致** → 纯 torch 回退路径与算子路径在规模上等价。
+1. **AscendC 的 `DataCopyPad` 要求 GM 目的地址 32B 对齐**（`sortdedup_v3` 头注释亦写明，
+   并指出「标量 SetValue 写 GM 不落地」）。按行写时若行宽不是 8 的倍数即违规：
 
-   **交付影响**：`npu_patches.install(require_ops=True)` 的强校验**保留**——它仍然能在算子
-   缺失时尽早暴露环境问题；但纯 torch 回退路径现在已是**正确**的，可用于无算子环境的冒烟与
-   小规模评测。
+   | 算子 | 行宽 | 是否对齐 |
+   |---|---:|---|
+   | `spconv_query` | `K_*4`，K_=27 → 108 B | ✗ |
+   | `spconv_gather` | `cin*kv*4`，stem 层 4×27 → 432 B | ✗ |
+   | `spconv_devox_v4` | `c_*4`，最后一层 19 类 → 76 B | ✗ |
 
-1. **CAP 是上限**：`N > CAP` 需要更大的 CAP（重编一张图）。分档即为此；
-2. **GE 静态每档一张图**；可选优化：把 CAP 改成从输入形状派生 + `set_dim_gears`，
-   可把分档的 K 次编译降为 1 次（未做）；
-3. **偶发 507035 未根治**：靠分块 + 逐帧落盘 + 二分重试绕过；
-   怀疑与超大体素数（seq08 单帧可达 ~95k 体素）下的 kernel tiling 有关，未定位；
-4. **逐类 IoU 的类名未标**：需要仓库自带 `semantic-kitti.yaml` 才能建立
-   `label_map` 索引 → 类名 的正确映射（mIoU/OA 是置换不变量，不受影响）；
-5. **aclgraph** 只能覆盖固定输入形状；
-6. 官方权重地址已 404，交付依赖 HF 镜像（本文档已记录可用链接）。
+2. **CANN 自带的 int64 小张量内核越界**：plog 里出错前最后的 kernel 序列为
+   `Cast → Maximum → Sub → Add → ReduceProd`（`aclnnAdds`/`aclnnProd`），正是
+   `dims = hi.long() - lo.long() + 1` 与 `int(torch.prod(dims.long()))`（4 元素 / 32B 规模）。
 
----
+**已修（实测有效）**
+
+- `query` / `gather`：改 8 行一组整块 `DataCopyPad`（8×行宽×4 恒为 32B 倍数），每核起始行按
+  8 向上取整，host/绑定把输出行数补到 8 的倍数并用 `narrow(0,0,M)` 返回；
+- `lo/hi/dims/total`：全部移到 host 侧用 Python 整数算（`_prod_host`/`_host_lo_dims`），
+  整段不再调用那几个内核；
+- 存活帧数：**27 → 145 → 261 → 1500 → 1606 → 2877 → 3857**（逐次推后）。
+
+**未修：`spconv_devox_v4`**
+
+它行内是 `acc` + `slotBuf[2]` 的预取双缓冲，任何写回改造都必须重建 `V_MTE3`/`MTE3_V`
+的成对 event 并处理尾块。两次尝试均未通过：
+
+| 尝试 | 结果 |
+|---|---|
+| 8 行整块写（同 query/gather） | 83 帧即崩——破坏了行内双缓冲的 event 时序 |
+| 行宽补齐到 8 通道（`cPad`）+ `narrow(1,0,c)` | 2000 帧通过，但单次全量 172 帧崩，存活低于改动前 |
+
+两次均已回滚（见提交 `c8411af` → `658f1e8`），源码与产物恢复原版。
+
+**规避（当前推荐做法）**：分段评测 —— `--start-idx/--max-frames` 分块 +
+`--stats-jsonl` 追加 + `--merge-stats` 按帧号去重合并。实测 14×300 帧 + 补两段，
+拿到 4,070 / 4,071 帧的完整结果：**mIoU 60.70% / OA 91.96%**。
+
+**下一步（devox 专项）**：先在算子自带 test/bench 里把写回打通（迭代 1 分钟级），
+再回灌整模验证，而不是在整模上盲试。
 
 ## 9. 文件索引
 

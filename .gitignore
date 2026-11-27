@@ -17,4 +17,4 @@ csrc/ascend/*/op_extension/build/
 csrc/ascend/*/build_out/
 
 # ---- 随包分发的算子产物（构建时生成，不入库）----
-core/ops/*.so
+core/ops/*.so*.bak

@@ -451,6 +451,11 @@ def _rect_map(in_coords, out_coords, ks, stride, dilation,
         return _rect_map_cap(in_coords, out_coords, ks, stride, dilation, n_in, n_out)
 
     offsets = get_kernel_offsets(ks, 1, dilation, device=in_coords.device)
+    if os.environ.get("TS_KMAP_DBG"):
+        print("[kmap] _QUERY=%s dev=%s n_out=%s kv=%s op=%s in=%s out=%s stride=%s"
+              % (_QUERY, in_coords.device.type, tuple(out_coords.shape),
+                 int(offsets.shape[0]), _query_op(), tuple(in_coords.shape),
+                 tuple(out_coords.shape), stride), flush=True)
     if (_QUERY and in_coords.device.type == "npu" and out_coords.shape[0]
             and offsets.shape[0] <= 32 and _query_op()):
         rkeys, start, cnt, meta, _ = _B._query_args(

@@ -264,9 +264,30 @@ def _const_tensor(vals, dtype, device):
     return t
 
 
+def _tree_reduce(t, op):
+    """沿 dim0 的树形归约：只用 elementwise 的 minimum/maximum，不调用 CANN 归约内核。
+
+    为什么不用 t.amin(0)/t.amax(0)：CANN 自带的 ReduceMax/ReduceMin 内核在大 N
+    （这里 9.5 万行 × 4 列）下 UB 划分超额，长跑随机报 507035（plog 里出错前的
+    kernel 就是 aclnnAmax/ReduceMax），而且崩后设备会级联不可用。
+
+    树形归约每层把行数减半、元素总量按 2N 递减（几何级数），总访存约 2N 个元素，
+    与一次归约同量级，但全程是纯 elementwise 的 min/max —— 不经过有缺陷的归约内核。
+    奇数行时用「前 h 行 vs 末 h 行」配对（重叠不影响 min/max 的正确性）。
+    """
+    cur = t
+    while cur.shape[0] > 1:
+        n = cur.shape[0]
+        h = n // 2
+        cur = op(cur[:h], cur[n - h:])
+    return cur[0]
+
+
 def _lo_hi(t, cache=False):
     """(min, max) over dim 0；cache 参数仅为兼容既有调用方保留。"""
-    return t.amin(0), t.amax(0)
+    if t.shape[0] <= 1:
+        return t[0] if t.shape[0] else t.sum(0) * 0, t[0] if t.shape[0] else t.sum(0) * 0
+    return _tree_reduce(t, torch.minimum), _tree_reduce(t, torch.maximum)
 
 
 def _prod_host(t):
@@ -363,9 +384,10 @@ def _fused_args(in_coords, out_coords, ks, stride, dilation):
     if offsets.shape[0] > 32:
         return None
     st3 = torch.tensor(stride, dtype=in_coords.dtype, device=in_coords.device)
-    lo_off, hi_off = offsets.amin(0).long(), offsets.amax(0).long()
-    in_lo, in_hi = in_coords.amin(0), in_coords.amax(0)
-    out_lo, out_hi = out_coords.amin(0), out_coords.amax(0)
+    lo_off, hi_off = _lo_hi(offsets)
+    lo_off, hi_off = lo_off.long(), hi_off.long()
+    in_lo, in_hi = _lo_hi(in_coords)
+    out_lo, out_hi = _lo_hi(out_coords)
     lo, dims = _host_lo_dims(in_lo, in_hi, out_lo, out_hi, lo_off, hi_off,
                              stride, out_coords.device)
     total = _fg.const(lambda: _prod_host((dims)),
@@ -496,7 +518,13 @@ def _kernel_map(in_coords, out_coords, ks, stride, dilation, n_in=None, pad="red
     One selection over the whole [kernel_volume, n_out] matrix (offset-major)
     instead of compare + nonzero + two gathers per offset."""
     offsets = get_kernel_offsets(ks, 1, dilation, device=in_coords.device)
-    idx = _lookup_offsets(in_coords, out_coords, stride, offsets)   # [n_out, kv]
+
+    # 快路径：SpconvQuery 内核（与 _rect_map 里的分支同一契约，返回同样的 [n_out, kv]）。
+    # 关键点：该路径的 meta 里 lo(4)/dims(4) 由 keyprep 在**设备侧**算出，因此完全不需要
+    # torch 侧的 amin/amax。CANN 自带的 ReduceMax/ReduceMin 内核在大 N（这里 9.5 万行）
+    # 下 UB 会越界，长跑随机报 507035（plog 里出错前的 kernel 就是 aclnnAmax/ReduceMax）。
+    # 实测 eager 下以前这里无条件走 torch，等于 AscendC 的 query 算子从未被使用。
+    idx = _lookup_offsets(in_coords, out_coords, stride, offsets).to(torch.int32)
     if n_in is not None and cap_enabled():
         # 补齐行复用了末行坐标，查表（lookup 对重复键返回**最大**行号）会落在补齐区。
         # 两种用法需要不同处理：

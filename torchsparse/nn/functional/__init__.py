@@ -315,20 +315,6 @@ def _lookup_offsets(in_coords, out_coords, stride, offsets):
     """[n_out, kernel_volume] row of `out_coord * stride + offset` inside
     in_coords, -1 when that neighbour voxel does not exist."""
     n_out, kv = out_coords.shape[0], offsets.shape[0]
-
-    # 快路径：直接用 SpconvQuery 内核。它的 meta 里 lo(4)/dims(4) 由 keyprep 在**设备侧**
-    # 算出（_query_args 的 keyprep 快路径直接返回 meta），因此这里不需要任何 torch 侧的
-    # amin/amax。这一点很关键：CANN 自带的 ReduceMax/ReduceMin 内核在大 N（~9.5 万行）
-    # 下 UB 会越界，长跑随机报 507035（plog 里出错前的 kernel 就是 aclnnAmax/ReduceMax）。
-    # 实测该 torch 路径每帧被 stem 层触发一次（kv=27, n_out=94625），正是 6 次 reduce 的来源。
-    if (_QUERY and kv <= 32 and int(n_out) > 0
-            and in_coords.device.type == "npu" and _query_op()):
-        import torchsparse.backend as _B
-        _rk, _st, _cn, _mt, _ = _B._query_args(in_coords, out_coords, stride, offsets)
-        if _rk is not None:
-            return torch.ops.npu.spconv_query(
-                out_coords.to(torch.int32), _rk, _st, _cn, _mt).to(torch.int32)
-
     cdt = out_coords.dtype                      # 保持 int32，避免 strided int64 cast
     st = _const_tensor(tuple(int(v) for v in stride), cdt, out_coords.device)
     base = out_coords[:, None, 1:] * st
@@ -341,10 +327,6 @@ def _lookup_offsets(in_coords, out_coords, stride, offsets):
     # Bounds come from the two coord sets' own extremes. Reducing the
     # [n_out, kv, 3] query tensor instead cost 0.70 ms/layer (~28 ms/forward):
     # it materialises 20000x27x3 int64 only to take a min over it.
-    if os.environ.get("TS_LOOKUP_DEBUG"):
-        print("[lookup] torch 路径 kv=%d n_out=%d in=%s"
-              % (int(offsets.shape[0]), int(out_coords.shape[0]),
-                 tuple(in_coords.shape)), flush=True)
     lo_off, hi_off = _lo_hi(offsets, cache=True)
     in_lo, in_hi = _lo_hi(in_coords)
     out_lo, out_hi = _lo_hi(out_coords)

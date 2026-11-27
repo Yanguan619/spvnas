@@ -30,11 +30,10 @@ _SD4_OK = None
 
 
 def _load_op_so(name):
-    """按候选路径加载算子 .so（core/ops → 源码树 → SPVNAS_OPS_ROOT/UNUM_OPS_ROOT）。"""
-    full = name if name.startswith("spconv_") else "spconv_" + name
-    if hasattr(torch.ops.npu, full):
-        return True
-    from ..nn.functional import _op_so_candidates  # 延迟导入，避免与 functional 循环依赖
+    if name.startswith("spconv_"):
+        name = name[len("spconv_"):]
+    from torchsparse.nn.functional import _load_cap_so
+    return _load_cap_so(name)  # 延迟导入，避免与 functional 循环依赖
     for so in _op_so_candidates(full):
         if not os.path.exists(so):
             continue
@@ -227,7 +226,7 @@ def unique_coords(coords):
             if os.environ.get("TS_FG_DEBUG"):
                 print("[uniq] fast 回退 dense:", type(e).__name__, e, flush=True)
     mins, dims = _bounds([coords])
-    total = _fg.const(lambda: int(torch.prod(dims.long())),
+    total = _fg.const(lambda: _prod_host((dims)),
                        ("total_uniq", tuple(coords.shape)))
     if total > DENSE_LIMIT or total < 4 * n:
         return torch.unique(coords, dim=0)
@@ -281,7 +280,7 @@ def _bounds(arrays):
     dims = maxs.long() - mins.long() + 1
     # shortcut: keys must stay below 2**62; a grid that big would need a real
     # hash table instead of dense-integer packing.
-    if _fg.const(lambda: bool(int(torch.prod(dims.long())) > 2**62),
+    if _fg.const(lambda: bool(_prod_host((dims)) > 2**62),
                  ("bounds_ok", tuple(arrays[0].shape))):
         raise RuntimeError(f"coordinate range too large to pack: {dims.tolist()}")
     return mins, dims
@@ -398,6 +397,32 @@ def _kprep_op():
     return _KPREP_OK
 
 
+def _prod_host(t):
+    """host 侧连乘，替代 _prod_host((t))。
+
+    CANN 自带的 int64 ReduceProd 内核在小张量上有越界访问 —— 实测长跑评测每
+    10~1600 帧随机触发 aivec 507035（plog 里出错前最后一个 kernel 就是
+    ReduceProd/aclnnProd）。这里改成一次 .tolist() 回 host 再连乘，彻底绕开它；
+    调用点都被 _fg.const 缓存，热路径无额外开销。
+    """
+    v = 1
+    for x in t.tolist():
+        v *= int(x)
+    return v
+
+
+def _host_bounds(*ts):
+    """把 4 元 int 张量的 min/max 取到 host，纯 Python 计算 lo/hi/dims。
+
+    CANN 自带的 int64 小张量算子（ReduceProd / Add / Sub / Maximum）在 4 元素
+    （32B）规模上会越界访问 —— 实测长跑每 10~2900 帧随机 aivec 507035，
+    plog 里出错前最后的 kernel 就是 Maximum/Sub/Add/ReduceProd。这里把这几步
+    搬到 host：一次 .tolist() 换整段设备算子，既避开内核缺陷，也少几个 kernel。
+    """
+    vals = [t.tolist() for t in ts]
+    return vals
+
+
 def _query_args(in_coords, out_coords, stride, offsets):
     """(rkeys, start, cnt, meta, total) for SpconvQuery. Bounds mirror
     _lookup_offsets so the two paths agree bit for bit."""
@@ -435,10 +460,22 @@ def _query_args(in_coords, out_coords, stride, offsets):
     off_lo, off_hi = offsets.amin(0).long(), offsets.amax(0).long()
     in_lo, in_hi = in_coords.amin(0), in_coords.amax(0)
     out_lo, out_hi = out_coords.amin(0), out_coords.amax(0)
-    lo = torch.minimum(in_lo, torch.cat([out_lo[:1], out_lo[1:] * st + off_lo]))
-    hi = torch.maximum(in_hi, torch.cat([out_hi[:1], out_hi[1:] * st + off_hi]))
-    dims = hi.long() - lo.long() + 1
-    total = _fg.const(lambda: int(torch.prod(dims.long())),
+    _in_lo, _in_hi = _host_bounds(in_lo, in_hi)
+    _out_lo, _out_hi = _host_bounds(out_lo, out_hi)
+    _off_lo, _off_hi = _host_bounds(off_lo, off_hi)
+    _st = [int(v) for v in st.tolist()]
+    lo_l = [min(int(_in_lo[k]),
+                int(_out_lo[k]) if k == 0
+                else int(_out_lo[k]) * _st[k - 1] + int(_off_lo[k - 1]))
+            for k in range(4)]
+    hi_l = [max(int(_in_hi[k]),
+                int(_out_hi[k]) if k == 0
+                else int(_out_hi[k]) * _st[k - 1] + int(_off_hi[k - 1]))
+            for k in range(4)]
+    dims_l = [hi_l[k] - lo_l[k] + 1 for k in range(4)]
+    lo = torch.tensor(lo_l, dtype=torch.int32, device=in_coords.device)
+    dims = torch.tensor(dims_l, dtype=torch.int64, device=in_coords.device)
+    total = _fg.const(lambda: _prod_host((dims)),
                        ("total_b", tuple(out_coords.shape)))
 
     n = in_coords.shape[0]
@@ -530,7 +567,7 @@ class GPUHashTable:
         full = torch.cat([batch, pos], dim=2).reshape(-1, 4)
 
         mins, dims = _bounds([self._coords, full])
-        total = _fg.const(lambda: int(torch.prod(dims.long())),
+        total = _fg.const(lambda: _prod_host((dims)),
                            ("total_lc", tuple(q.shape)))
         qk = pack_keys(full, mins, dims)
         if q.device.type == "npu" and total <= DENSE_LIMIT:

@@ -269,6 +269,48 @@ def _lo_hi(t, cache=False):
     return t.amin(0), t.amax(0)
 
 
+def _prod_host(t):
+    """host 侧连乘，替代 _prod_host((t))。
+
+    CANN 自带的 int64 ReduceProd 内核在小张量上有越界访问 —— 实测长跑评测每
+    10~1600 帧随机触发 aivec 507035（plog 里出错前最后一个 kernel 就是
+    ReduceProd/aclnnProd）。这里改成一次 .tolist() 回 host 再连乘，彻底绕开它；
+    调用点都被 _fg.const 缓存，热路径无额外开销。
+    """
+    v = 1
+    for x in t.tolist():
+        v *= int(x)
+    return v
+
+
+def _host_lo_dims(in_lo, in_hi, out_lo, out_hi, lo_off, hi_off, stride, device):
+    """host 侧算 lo/dims，替掉设备上的 Maximum/Sub/Add 组合。
+
+    CANN 自带的 int64 小张量算子（Maximum/Add/Sub/ReduceProd）在 4 元素（32B）
+    规模上会越界访问：实测长跑每 10~2900 帧随机 aivec 507035，plog 里出错前最后
+    的 kernel 就是 Maximum/Sub/Add/ReduceProd。这里一次 .tolist() 取回 6 个标量，
+    余下纯 Python，既避开内核缺陷也少几个 kernel。
+    """
+    def L(x):
+        return [int(v) for v in x.tolist()]
+
+    i_lo, i_hi = L(in_lo), L(in_hi)
+    o_lo, o_hi = L(out_lo), L(out_hi)
+    l_off, h_off = L(lo_off), L(hi_off)
+    st = [int(v) for v in stride]
+    lo, dims = [], []
+    for k in range(4):
+        a = i_lo[k]
+        # stride/offset 只有 3 个空间维：batch 维(k=0)不乘 stride
+        b = o_lo[k] if k == 0 else o_lo[k] * st[k - 1] + l_off[k - 1]
+        lo.append(min(a, b))
+        a2 = i_hi[k]
+        b2 = o_hi[k] if k == 0 else o_hi[k] * st[k - 1] + h_off[k - 1]
+        dims.append(max(a2, b2) - lo[-1] + 1)
+    return (torch.tensor(lo, dtype=torch.int32, device=device),
+            torch.tensor(dims, dtype=torch.int64, device=device))
+
+
 def _lookup_offsets(in_coords, out_coords, stride, offsets):
     """[n_out, kernel_volume] row of `out_coord * stride + offset` inside
     in_coords, -1 when that neighbour voxel does not exist."""
@@ -290,10 +332,9 @@ def _lookup_offsets(in_coords, out_coords, stride, offsets):
     out_lo, out_hi = _lo_hi(out_coords)
     st3 = _const_tensor(tuple(int(v) for v in stride), out_coords.dtype,
                         out_coords.device)
-    lo = torch.minimum(in_lo, torch.cat([out_lo[:1], out_lo[1:] * st3 + lo_off]))
-    hi = torch.maximum(in_hi, torch.cat([out_hi[:1], out_hi[1:] * st3 + hi_off]))
-    mins, dims = lo, hi.long() - lo.long() + 1
-    total = _fg.const(lambda: int(torch.prod(dims.long())),
+    mins, dims = _host_lo_dims(in_lo, in_hi, out_lo, out_hi, lo_off, hi_off,
+                               stride, out_coords.device)
+    total = _fg.const(lambda: _prod_host((dims)),
                        ("total_f", tuple(out_coords.shape)))
     qk = pack_keys(q_flat, mins, dims)
     if in_coords.device.type == "npu" and total <= _DENSE_LIMIT:
@@ -319,10 +360,9 @@ def _fused_args(in_coords, out_coords, ks, stride, dilation):
     lo_off, hi_off = offsets.amin(0).long(), offsets.amax(0).long()
     in_lo, in_hi = in_coords.amin(0), in_coords.amax(0)
     out_lo, out_hi = out_coords.amin(0), out_coords.amax(0)
-    lo = torch.minimum(in_lo, torch.cat([out_lo[:1], out_lo[1:] * st3 + lo_off]))
-    hi = torch.maximum(in_hi, torch.cat([out_hi[:1], out_hi[1:] * st3 + hi_off]))
-    dims = hi.long() - lo.long() + 1
-    total = _fg.const(lambda: int(torch.prod(dims.long())),
+    lo, dims = _host_lo_dims(in_lo, in_hi, out_lo, out_hi, lo_off, hi_off,
+                             stride, out_coords.device)
+    total = _fg.const(lambda: _prod_host((dims)),
                        ("total_fa", tuple(in_coords.shape)))
 
     n = in_coords.shape[0]
@@ -497,7 +537,10 @@ def _apply_forward_eager(feats, weight, kmap, n_out, nb=None, n_real=None):
                     feats, nb, weight.reshape(ktot, cout).contiguous())
             except Exception:
                 pass
-        dense = torch.ops.npu.spconv_gather(feats, nb)
+        # 交付的 spconv_gather schema 是 (feat, nb, params)，params=[M, cin, kcnt]
+        _p = _const_tensor((int(nb.shape[0]), int(feats.shape[1]), int(weight.shape[0])),
+                           torch.int32, feats.device)
+        dense = torch.ops.npu.spconv_gather(feats, nb, _p)
         return dense @ weight.reshape(ktot, cout)
 
     kmap = kmap[:3]

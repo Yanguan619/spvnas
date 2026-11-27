@@ -314,6 +314,12 @@ def _host_lo_dims(in_lo, in_hi, out_lo, out_hi, lo_off, hi_off, stride, device):
 def _lookup_offsets(in_coords, out_coords, stride, offsets):
     """[n_out, kernel_volume] row of `out_coord * stride + offset` inside
     in_coords, -1 when that neighbour voxel does not exist."""
+    if os.environ.get("TS_LOOKUP_DEBUG"):
+        import sys as _s
+        _f = _s._getframe(1)
+        print("[lookup] 调用者=%s:%d kv=%d n_out=%d"
+              % (_f.f_code.co_name, _f.f_lineno, int(offsets.shape[0]),
+                 int(out_coords.shape[0])), flush=True)
     n_out, kv = out_coords.shape[0], offsets.shape[0]
     cdt = out_coords.dtype                      # 保持 int32，避免 strided int64 cast
     st = _const_tensor(tuple(int(v) for v in stride), cdt, out_coords.device)
@@ -460,6 +466,11 @@ def _rect_map(in_coords, out_coords, ks, stride, dilation,
             and offsets.shape[0] <= 32 and _query_op()):
         rkeys, start, cnt, meta, _ = _B._query_args(
             in_coords, out_coords, stride, offsets)
+        if os.environ.get("TS_LOOKUP_DEBUG"):
+            print("[kmap] query_args -> rkeys=%s start=%s cnt=%s"
+                  % (None if rkeys is None else tuple(rkeys.shape),
+                     None if start is None else tuple(start.shape),
+                     None if cnt is None else tuple(cnt.shape)), flush=True)
         if rkeys is not None:
             return torch.ops.npu.spconv_query(
                 out_coords.to(torch.int32), rkeys, start, cnt, meta)

@@ -48,13 +48,9 @@ public:
         coordGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(coords));
         outGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(out));
 
-        // 行宽补齐到 8 的倍数：c_*4 不是 32B 倍数（最后一层 c_=19 → 76 B）时，
-        // DataCopyPad 的目的地址会错位 → 偶发 aivec 507035。补齐后行距 = cPad*4 ≡ 0 (mod 32)。
-        cPad_ = (c_ + 7) / 8 * 8;
         const uint32_t bytes = static_cast<uint32_t>(c_ * sizeof(float));
-        const uint32_t bytesPad = static_cast<uint32_t>(cPad_ * sizeof(float));
         if (N_ > 0 && c_ > 0) {
-            pipe_->InitBuffer(accBuf_, bytesPad);
+            pipe_->InitBuffer(accBuf_, bytes);
             pipe_->InitBuffer(slotBuf_[0], bytes);
             pipe_->InitBuffer(slotBuf_[1], bytes);
         }
@@ -155,11 +151,10 @@ public:
         pp.isPad = false;
         DataCopyExtParams piece;
         piece.blockCount = 1;
-        piece.blockLen = static_cast<uint32_t>(c_ * sizeof(float));   // read: real width
+        piece.blockLen = static_cast<uint32_t>(c_ * sizeof(float));
         piece.srcStride = 0;
         piece.dstStride = 0;
-        DataCopyExtParams whole = piece;                        // write: padded width
-        whole.blockLen = static_cast<uint32_t>(cPad_ * sizeof(float));
+        const DataCopyExtParams whole = piece;
 
         LocalTensor<float> acc = accBuf_.Get<float>();
 
@@ -185,7 +180,7 @@ public:
                 }
             }
 
-            Duplicate(acc, 0.0f, static_cast<int32_t>(cPad_));   // 连同补齐列一起清零
+            Duplicate(acc, 0.0f, static_cast<int32_t>(c_));
             SetFlag<HardEvent::V_MTE2>(evtV2M_[0]);
             WaitFlag<HardEvent::V_MTE2>(evtV2M_[0]);
             SetFlag<HardEvent::V_MTE2>(evtV2M_[1]);
@@ -261,7 +256,6 @@ private:
     bool dyn_ = false;
     int64_t N_ = 0;
     int64_t c_ = 0;
-    int64_t cPad_ = 0;
     int64_t k_ = 0;
     bool calcW_ = false;
     float scale_ = 1.0f;

@@ -88,10 +88,7 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
     }
     out->SetDimNum(2);
     out->SetDim(0, is->GetDim(1));
-    {
-        const int64_t cc = fs->GetDim(1);
-        out->SetDim(1, (cc + 7) / 8 * 8);   // 宽度补齐 8：配合内核的 32B 对齐行距
-    }
+    out->SetDim(1, fs->GetDim(1));
     return GRAPH_SUCCESS;
 }
 

@@ -351,6 +351,9 @@ def bucket_lookup(qkeys, rkeys, total=None):
     dev = rkeys.device
     ones = torch.ones(n, dtype=torch.int32, device=dev)
     hist = torch.zeros(nbk, dtype=torch.int32, device=dev)
+    if os.environ.get("TS_IA_DBG"):
+        print("[ia] bucket_lookup 直方图 nbk=%d n=%d"
+              % (int(hist.shape[0]), int(rkeys.shape[0])), flush=True)
     hist.index_add_(0, _shr(rkeys, shift).to(torch.int64)
                     if rkeys.dtype != torch.int64 else _shr(rkeys, shift), ones)
     start = (torch.cumsum(hist, 0) - hist).to(torch.int32)
@@ -486,6 +489,9 @@ def _query_args(in_coords, out_coords, stride, offsets):
     shift = max(0, (total - 1).bit_length() - (nbk.bit_length() - 1))
     rkeys = pack_keys(in_coords, lo, dims)
     hist = torch.zeros(nbk, dtype=torch.float32, device=in_coords.device)
+    if os.environ.get("TS_IA_DBG"):
+        print("[ia] _query_args 慢路径直方图 nbk=%d n=%d"
+              % (int(hist.shape[0]), int(rkeys.shape[0])), flush=True)
     hist.index_add_(0, rkeys >> shift,
                     torch.ones(n, dtype=torch.float32, device=in_coords.device))
     # float32 cumsum: same values (counts << 2^24) but 1.1-1.6x faster than int32
